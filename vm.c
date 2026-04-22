@@ -12,7 +12,7 @@
 #define MAX_INS 10000
 #define MAX_FRONTIER 2000
 #define MAX_LOCAL 128
-#define MAX_BOXES_PER_TERM 4
+#define MAX_BOXES_PER_TERM 16
 #define MAX_TOTAL_BOXES 8000
 #define IMAGE_W 1024
 #define IMAGE_H 1024
@@ -29,6 +29,24 @@
 #ifndef BUILD_BOXES_EACH_RUN
 #define BUILD_BOXES_EACH_RUN 1
 #endif
+#ifndef BASE_REFINE_ROUNDS
+#define BASE_REFINE_ROUNDS 4
+#endif
+#ifndef CHILD_REFINE_ROUNDS
+#define CHILD_REFINE_ROUNDS 2
+#endif
+#ifndef MAX_SPLIT_DEPTH
+#define MAX_SPLIT_DEPTH 4
+#endif
+#ifndef AREA_THRESHOLD
+#define AREA_THRESHOLD 0.0095f
+#endif
+#ifndef UNION_AREA_SHRINK
+#define UNION_AREA_SHRINK 0.95f
+#endif
+#ifndef PARALLEL_CLEAR_IMAGE
+#define PARALLEL_CLEAR_IMAGE 1
+#endif
 
 typedef enum {OP_CONST, OP_VARX, OP_VARY, OP_ADD, OP_SUB, OP_MUL, OP_NEG, OP_SQUARE, OP_SQRT, OP_MIN, OP_MAX} Op;
 typedef enum {MODE_SCALAR, MODE_X, MODE_Y, MODE_FULL} ValueMode;
@@ -36,7 +54,16 @@ typedef struct { Op op; int16_t a, b; float fa, fb; } Instr;
 typedef struct { float lo, hi; } Interval;
 typedef struct { float x0,x1,y0,y1; } Box;
 typedef struct { char key[32]; int idx; } IdMap;
-typedef struct { uint16_t n; uint16_t root; int16_t xlocal, ylocal; Instr ins[MAX_LOCAL]; uint8_t mode[MAX_LOCAL]; } CompactTape;
+typedef struct {
+    uint16_t n;
+    uint16_t root;
+    int16_t xlocal, ylocal;
+    uint8_t nxops, nyops;
+    Instr ins[MAX_LOCAL];
+    uint8_t mode[MAX_LOCAL];
+    uint8_t xops[MAX_LOCAL];
+    uint8_t yops[MAX_LOCAL];
+} CompactTape;
 typedef struct { uint16_t tape_idx; Box b; } WorkBox;
 
 typedef struct {
@@ -51,6 +78,8 @@ typedef struct {
 static Instr gins[MAX_INS];
 static int nins=0, root=-1, xidx=-1, yidx=-1;
 static int frontier[MAX_FRONTIER], nfrontier=0;
+static uint16_t frontier_mark[MAX_INS];
+static uint16_t frontier_mark_gen = 1;
 static IdMap ids[MAX_INS]; static int nids=0;
 static CompactTape tapes[MAX_FRONTIER];
 static WorkBox work_boxes[MAX_TOTAL_BOXES];
@@ -161,7 +190,25 @@ static void load_vm(const char* path){
     fclose(f); root=nins-1;
 }
 
-static void extract_frontier(void){ nfrontier=0; uint8_t mark[MAX_INS]={0}; int st[MAX_INS], sp=0; st[sp++]=root; while(sp){ int v=st[--sp]; if(mark[v]) continue; mark[v]=1; Instr in=gins[v]; if(in.op==OP_MIN){ if(in.a>=0) st[sp++]=in.a; if(in.b>=0) st[sp++]=in.b; } else frontier[nfrontier++]=v; } }
+static void extract_frontier(void){
+    nfrontier=0;
+    if(++frontier_mark_gen == 0){
+        memset(frontier_mark, 0, sizeof(frontier_mark));
+        frontier_mark_gen = 1;
+    }
+    int st[MAX_INS], sp=0;
+    st[sp++]=root;
+    while(sp){
+        int v=st[--sp];
+        if(frontier_mark[v] == frontier_mark_gen) continue;
+        frontier_mark[v] = frontier_mark_gen;
+        Instr in=gins[v];
+        if(in.op==OP_MIN){
+            if(in.a>=0) st[sp++]=in.a;
+            if(in.b>=0) st[sp++]=in.b;
+        } else frontier[nfrontier++]=v;
+    }
+}
 
 static inline void build_worker_init(Worker* w){
     memset(w->desired_tag,0,sizeof(w->desired_tag));
@@ -195,6 +242,7 @@ static inline bool build_compact_tape_term(Worker* w, int fi, CompactTape* tp){
     }
     tp->n = (uint16_t)postn;
     tp->xlocal = tp->ylocal = -1;
+    tp->nxops = tp->nyops = 0;
     for(int i=0;i<postn;i++) w->local_map[w->post[i]] = i;
     for(int i=0;i<postn;i++){
         int gv = w->post[i];
@@ -224,6 +272,8 @@ static inline bool build_compact_tape_term(Worker* w, int fi, CompactTape* tp){
         if(gv == xidx) tp->xlocal = i;
         if(gv == yidx) tp->ylocal = i;
         if(gv == fr) tp->root = i;
+        if(tp->mode[i] != MODE_Y && tp->mode[i] != MODE_FULL) tp->xops[tp->nxops++] = (uint8_t)i;
+        if(tp->mode[i] != MODE_SCALAR && tp->mode[i] != MODE_X) tp->yops[tp->nyops++] = (uint8_t)i;
     }
     return true;
 }
@@ -285,39 +335,39 @@ static inline bool contract_once(Worker* w, const CompactTape* tp, Box domain, B
 static inline bool refine_iters(Worker* w, const CompactTape* tp, Box in, int rounds, Box* out){
     Box cur=in;
     for(int i=0;i<rounds;i++){
+        Box prev = cur;
         Box nxt; if(!contract_once(w,tp,cur,&nxt)) return false;
         cur.x0=fmaxf(cur.x0,nxt.x0); cur.x1=fminf(cur.x1,nxt.x1); cur.y0=fmaxf(cur.y0,nxt.y0); cur.y1=fminf(cur.y1,nxt.y1);
         if(cur.x0>cur.x1 || cur.y0>cur.y1) return false;
+        if(cur.x0 == prev.x0 && cur.x1 == prev.x1 && cur.y0 == prev.y0 && cur.y1 == prev.y1) break;
     }
     *out=cur; return true;
 }
 
 static inline void split_box(Box b, Box out[2]){ float dx=b.x1-b.x0, dy=b.y1-b.y0; if(dx>=dy){ float xm=0.5f*(b.x0+b.x1); out[0]=(Box){b.x0,xm,b.y0,b.y1}; out[1]=(Box){xm,b.x1,b.y0,b.y1}; } else { float ym=0.5f*(b.y0+b.y1); out[0]=(Box){b.x0,b.x1,b.y0,ym}; out[1]=(Box){b.x0,b.x1,ym,b.y1}; } }
 
-static inline int multi_box_refine(Worker* w, const CompactTape* tp, WorkBox* out_boxes, int tape_idx){
-    Box base; if(!refine_iters(w,tp,(Box){-1,1,-1,1},3,&base) || box_area(base)<=0.0f) return 0;
-    Box leaves[8]; int nleaves=1; leaves[0]=base; const float area_threshold=0.02f;
-    for(int depth=0; depth<4; depth++){
-        Box next[8]; int nnext=0; bool changed=false;
+static inline int multi_box_refine(Worker* w, const CompactTape* tp, Box* out_boxes){
+    Box base; if(!refine_iters(w,tp,(Box){-1,1,-1,1},BASE_REFINE_ROUNDS,&base) || box_area(base)<=0.0f) return 0;
+    Box leaves[MAX_BOXES_PER_TERM]; int nleaves=1; leaves[0]=base;
+    for(int depth=0; depth<MAX_SPLIT_DEPTH; depth++){
+        Box next[MAX_BOXES_PER_TERM]; int nnext=0; bool changed=false;
         for(int i=0;i<nleaves;i++){
             Box b=leaves[i]; float ba=box_area(b);
-            if(ba<=area_threshold){ next[nnext++]=b; continue; }
+            if(ba<=AREA_THRESHOLD || nnext + 2 > MAX_BOXES_PER_TERM){ next[nnext++]=b; continue; }
             Box kids[2]; split_box(b,kids); Box kept[2]; int nkept=0; float union_area=0.0f;
-            for(int k=0;k<2;k++){ Box rb; if(refine_iters(w,tp,kids[k],2,&rb)){ float ra=box_area(rb); if(ra>0.0f){ kept[nkept++]=rb; union_area += ra; } } }
-            if(nkept>=1 && union_area < 0.92f*ba){ for(int k=0;k<nkept;k++) next[nnext++]=kept[k]; changed=true; }
+            for(int k=0;k<2;k++){ Box rb; if(refine_iters(w,tp,kids[k],CHILD_REFINE_ROUNDS,&rb)){ float ra=box_area(rb); if(ra>0.0f){ kept[nkept++]=rb; union_area += ra; } } }
+            if(nkept>=1 && union_area < UNION_AREA_SHRINK*ba){ for(int k=0;k<nkept;k++) next[nnext++]=kept[k]; changed=true; }
             else next[nnext++]=b;
         }
         memcpy(leaves,next,nnext*sizeof(Box)); nleaves=nnext; if(!changed) break;
     }
-    for(int i=0;i<nleaves;i++){ out_boxes[i].tape_idx=(uint16_t)tape_idx; out_boxes[i].b=leaves[i]; }
+    for(int i=0;i<nleaves;i++) out_boxes[i] = leaves[i];
     return nleaves;
 }
 
 static inline int clampi(int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); }
 
-static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
-    const CompactTape* tp = &tapes[wb->tape_idx];
-    Box b = wb->b;
+static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
     int x0 = clampi((int)floorf((b.x0 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W-1);
     int x1 = clampi((int)ceilf ((b.x1 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W);
     int y0 = clampi((int)floorf((b.y0 + 1.0f) * 0.5f * IMAGE_H), 0, IMAGE_H-1);
@@ -325,8 +375,8 @@ static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
     if(x1 <= x0 || y1 <= y0) return;
     int width = x1 - x0;
 
-    for(int v=0; v<tp->n; v++){
-        if(tp->mode[v] == MODE_Y || tp->mode[v] == MODE_FULL) continue;
+    for(int vi=0; vi<tp->nxops; vi++){
+        int v = tp->xops[vi];
         Instr in = tp->ins[v];
         float *dst = w->vals[v];
         switch(in.op){
@@ -385,8 +435,8 @@ static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
 
     for(int py = y0; py < y1; py++){
         float yv = gycoords[py];
-        for(int v=0; v<tp->n; v++){
-            if(tp->mode[v] == MODE_SCALAR || tp->mode[v] == MODE_X) continue;
+        for(int vi=0; vi<tp->nyops; vi++){
+            int v = tp->yops[vi];
             Instr in = tp->ins[v];
             float *dst = w->vals[v];
             switch(in.op){
@@ -447,20 +497,43 @@ static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
     }
 }
 
+static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
+    eval_box_pixels_tp(w, &tapes[wb->tape_idx], wb->b);
+}
+
 static void build_tapes_and_boxes_omp(Worker* w){
-    WorkBox local_boxes[32];
-    #pragma omp for schedule(OMP_SCHEDULE_KIND)
+    Box local_boxes[MAX_BOXES_PER_TERM];
+    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
     for(int i=0;i<nfrontier;i++){
-        CompactTape tp;
-        if(!build_compact_tape_term(w, i, &tp)) continue;
-        tapes[i] = tp;
-        int nb = multi_box_refine(w, &tapes[i], local_boxes, i);
+        CompactTape* tp = &tapes[i];
+        if(!build_compact_tape_term(w, i, tp)) continue;
+        int nb = multi_box_refine(w, tp, local_boxes);
         if(nb > 0){
             int base;
             #pragma omp atomic capture
             { base = nwork_boxes; nwork_boxes += nb; }
-            for(int k=0;k<nb;k++) work_boxes[base + k] = local_boxes[k];
+            for(int k=0;k<nb;k++){
+                work_boxes[base + k].tape_idx = (uint16_t)i;
+                work_boxes[base + k].b = local_boxes[k];
+            }
         }
+    }
+}
+
+static void process_terms_streaming_omp(Worker* w){
+    int local_box_count = 0;
+    Box local_boxes[MAX_BOXES_PER_TERM];
+    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
+    for(int i=0;i<nfrontier;i++){
+        CompactTape tp;
+        if(!build_compact_tape_term(w, i, &tp)) continue;
+        int nb = multi_box_refine(w, &tp, local_boxes);
+        for(int k=0;k<nb;k++) eval_box_pixels_tp(w, &tp, local_boxes[k]);
+        local_box_count += nb;
+    }
+    if(local_box_count){
+        #pragma omp atomic
+        nwork_boxes += local_box_count;
     }
 }
 
@@ -475,7 +548,7 @@ static int build_tapes_and_boxes_parallel(void){
 }
 
 static void render_boxes_omp(Worker* w){
-    #pragma omp for schedule(OMP_SCHEDULE_KIND)
+    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
     for(int i=0;i<nwork_boxes;i++) eval_box_pixels(w, &work_boxes[i]);
 }
 
@@ -486,6 +559,35 @@ static void render_boxes_parallel(void){
         Worker w; render_worker_init(&w);
         render_boxes_omp(&w);
     }
+}
+
+static void clear_image_omp(void){
+#if PARALLEL_CLEAR_IMAGE
+    #pragma omp for schedule(static) nowait
+    for(int i=0;i<IMAGE_W*IMAGE_H;i++) image[i] = 0;
+#else
+    #pragma omp single
+    memset(image, 0, sizeof(image));
+#endif
+}
+
+static void run_full_pipeline_omp(Worker* w){
+#if EXTRACT_FRONTIER_EACH_RUN
+    #pragma omp single
+    extract_frontier();
+#endif
+#if BUILD_BOXES_EACH_RUN
+    #pragma omp single
+    nwork_boxes = 0;
+    clear_image_omp();
+    #pragma omp barrier
+    process_terms_streaming_omp(w);
+#else
+    clear_image_omp();
+    #pragma omp barrier
+    render_boxes_omp(w);
+#endif
+    #pragma omp barrier
 }
 
 static int checksum_image(void){
@@ -500,7 +602,7 @@ static int run_full_pipeline(void){
 #endif
 #if BUILD_BOXES_EACH_RUN
     nwork_boxes = 0;
-#ifdef PROFILE_PHASES
+#if defined(PROFILE_PHASES)
     double t_build_start = 0.0, t_build_end = 0.0;
 #endif
 #elif defined(PROFILE_PHASES)
@@ -509,40 +611,39 @@ static int run_full_pipeline(void){
     memset(image, 0, sizeof(image));
     #pragma omp parallel
     {
-        Worker render_w;
 #if BUILD_BOXES_EACH_RUN
-        Worker build_w;
-        build_worker_init(&build_w);
-#endif
-        render_worker_init(&render_w);
-#ifdef PROFILE_PHASES
-#if BUILD_BOXES_EACH_RUN
+        Worker w;
+        build_worker_init(&w);
+#if defined(PROFILE_PHASES)
+        render_worker_init(&w);
         #pragma omp single
         t_build_start = now_sec();
-#else
-        #pragma omp single
-        t_render_start = now_sec();
-#endif
-#endif
-#if BUILD_BOXES_EACH_RUN
-        build_tapes_and_boxes_omp(&build_w);
-#ifdef PROFILE_PHASES
+        build_tapes_and_boxes_omp(&w);
         #pragma omp barrier
         #pragma omp single
         {
             t_build_end = now_sec();
             g_profile_build_ms += (t_build_end - t_build_start) * 1000.0;
         }
-#endif
-#endif
-        render_boxes_omp(&render_w);
-#ifdef PROFILE_PHASES
+        render_boxes_omp(&w);
         #pragma omp barrier
         #pragma omp single
-#if BUILD_BOXES_EACH_RUN
         g_profile_render_ms += (now_sec() - t_build_end) * 1000.0;
 #else
+        process_terms_streaming_omp(&w);
+#endif
+#else
+        Worker render_w;
+        render_worker_init(&render_w);
+#if defined(PROFILE_PHASES)
+        #pragma omp single
+        t_render_start = now_sec();
+        render_boxes_omp(&render_w);
+        #pragma omp barrier
+        #pragma omp single
         g_profile_render_ms += (now_sec() - t_render_start) * 1000.0;
+#else
+        render_boxes_omp(&render_w);
 #endif
 #endif
     }
@@ -570,6 +671,7 @@ int main(int argc, char** argv){ init_coords();
     printf("Full pipeline + frontier extraction + raster/eval benchmark\n");
     printf("instructions: %d\nfrontier_terms: %d\nimage: %dx%d\nmax_threads: %d\n", nins, nfrontier, IMAGE_W, IMAGE_H, max_threads);
     const int runs=BENCH_RUNS; double times[runs]; int boxes=-1, sum=-1;
+    #ifdef PROFILE_PHASES
     for(int r=0;r<runs;r++){
         double t0=now_sec();
         boxes=run_full_pipeline();
@@ -578,6 +680,28 @@ int main(int argc, char** argv){ init_coords();
         sum = checksum_image();
         if(boxes!=warm_boxes || sum!=warm_sum){ fprintf(stderr,"mismatch boxes=%d/%d checksum=%d/%d\n", boxes, warm_boxes, sum, warm_sum); return 1; }
     }
+    #else
+    double timed_t0 = 0.0;
+    #pragma omp parallel
+    {
+        Worker w;
+        build_worker_init(&w);
+        render_worker_init(&w);
+        for(int r=0;r<runs;r++){
+            #pragma omp single
+            timed_t0 = now_sec();
+            run_full_pipeline_omp(&w);
+            #pragma omp single
+            {
+                double t1=now_sec();
+                times[r]=(t1-timed_t0)*1000.0;
+                boxes = nwork_boxes;
+                sum = checksum_image();
+                if(boxes!=warm_boxes || sum!=warm_sum){ fprintf(stderr,"mismatch boxes=%d/%d checksum=%d/%d\n", boxes, warm_boxes, sum, warm_sum); exit(1); }
+            }
+        }
+    }
+    #endif
     double agg=0,minv=1e9,maxv=0; for(int i=0;i<runs;i++){ agg+=times[i]; if(times[i]<minv) minv=times[i]; if(times[i]>maxv) maxv=times[i]; }
     printf("threads=%d boxes=%d checksum=%d runs_ms:", max_threads, boxes, sum);
     for(int i=0;i<runs;i++) printf(" %.3f", times[i]);
