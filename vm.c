@@ -13,40 +13,16 @@
 #define MAX_FRONTIER 2000
 #define MAX_LOCAL 128
 #define MAX_BOXES_PER_TERM 16
-#define MAX_TOTAL_BOXES 8000
 #define IMAGE_W 1024
 #define IMAGE_H 1024
 #define NEG_INF (-1e30f)
-#ifndef OMP_SCHEDULE_KIND
 #define OMP_SCHEDULE_KIND guided,1
-#endif
-#ifndef BENCH_RUNS
 #define BENCH_RUNS 8
-#endif
-#ifndef EXTRACT_FRONTIER_EACH_RUN
-#define EXTRACT_FRONTIER_EACH_RUN 1
-#endif
-#ifndef BUILD_BOXES_EACH_RUN
-#define BUILD_BOXES_EACH_RUN 1
-#endif
-#ifndef BASE_REFINE_ROUNDS
 #define BASE_REFINE_ROUNDS 4
-#endif
-#ifndef CHILD_REFINE_ROUNDS
 #define CHILD_REFINE_ROUNDS 2
-#endif
-#ifndef MAX_SPLIT_DEPTH
 #define MAX_SPLIT_DEPTH 4
-#endif
-#ifndef AREA_THRESHOLD
 #define AREA_THRESHOLD 0.0095f
-#endif
-#ifndef UNION_AREA_SHRINK
 #define UNION_AREA_SHRINK 0.95f
-#endif
-#ifndef PARALLEL_CLEAR_IMAGE
-#define PARALLEL_CLEAR_IMAGE 1
-#endif
 
 typedef enum {OP_CONST, OP_VARX, OP_VARY, OP_ADD, OP_SUB, OP_MUL, OP_NEG, OP_SQUARE, OP_SQRT, OP_MIN, OP_MAX} Op;
 typedef enum {MODE_SCALAR, MODE_X, MODE_Y, MODE_FULL} ValueMode;
@@ -64,7 +40,6 @@ typedef struct {
     uint8_t xops[MAX_LOCAL];
     uint8_t yops[MAX_LOCAL];
 } CompactTape;
-typedef struct { uint16_t tape_idx; Box b; } WorkBox;
 
 typedef struct {
     Interval fwd[MAX_LOCAL], desired[MAX_LOCAL];
@@ -81,65 +56,11 @@ static int frontier[MAX_FRONTIER], nfrontier=0;
 static uint16_t frontier_mark[MAX_INS];
 static uint16_t frontier_mark_gen = 1;
 static IdMap ids[MAX_INS]; static int nids=0;
-static CompactTape tapes[MAX_FRONTIER];
-static WorkBox work_boxes[MAX_TOTAL_BOXES];
 static int nwork_boxes = 0;
 static uint8_t image[IMAGE_W * IMAGE_H];
 static float gxcoords[IMAGE_W], gycoords[IMAGE_H];
 static inline int clampi(int v, int lo, int hi);
 static inline float box_area(Box b);
-#ifdef PROFILE_PHASES
-static double g_profile_build_ms = 0.0;
-static double g_profile_render_ms = 0.0;
-#endif
-#ifdef PROFILE_STATS
-static void print_work_stats(void){
-    int active_tapes = 0;
-    int total_ins = 0;
-    int min_ins = MAX_LOCAL;
-    int max_ins = 0;
-    double total_area = 0.0;
-    double total_pixels = 0.0;
-    int min_w = IMAGE_W, max_w = 0, min_h = IMAGE_H, max_h = 0;
-    for(int i = 0; i < nfrontier; i++){
-        if(tapes[i].n == 0) continue;
-        active_tapes++;
-        total_ins += tapes[i].n;
-        if(tapes[i].n < min_ins) min_ins = tapes[i].n;
-        if(tapes[i].n > max_ins) max_ins = tapes[i].n;
-    }
-    for(int i = 0; i < nwork_boxes; i++){
-        Box b = work_boxes[i].b;
-        int x0 = clampi((int)floorf((b.x0 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W-1);
-        int x1 = clampi((int)ceilf ((b.x1 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W);
-        int y0 = clampi((int)floorf((b.y0 + 1.0f) * 0.5f * IMAGE_H), 0, IMAGE_H-1);
-        int y1 = clampi((int)ceilf ((b.y1 + 1.0f) * 0.5f * IMAGE_H), 0, IMAGE_H);
-        int w = x1 - x0;
-        int h = y1 - y0;
-        if(w <= 0 || h <= 0) continue;
-        total_area += box_area(b);
-        total_pixels += (double)w * (double)h;
-        if(w < min_w) min_w = w;
-        if(w > max_w) max_w = w;
-        if(h < min_h) min_h = h;
-        if(h > max_h) max_h = h;
-    }
-    printf("stats: active_tapes=%d avg_tape_ins=%.2f min_tape_ins=%d max_tape_ins=%d\n",
-           active_tapes,
-           active_tapes ? (double)total_ins / (double)active_tapes : 0.0,
-           active_tapes ? min_ins : 0,
-           max_ins);
-    printf("stats: boxes=%d avg_box_area=%.6f avg_box_pixels=%.1f min_box_w=%d max_box_w=%d min_box_h=%d max_box_h=%d total_box_pixels=%.0f\n",
-           nwork_boxes,
-           nwork_boxes ? total_area / (double)nwork_boxes : 0.0,
-           nwork_boxes ? total_pixels / (double)nwork_boxes : 0.0,
-           nwork_boxes ? min_w : 0,
-           max_w,
-           nwork_boxes ? min_h : 0,
-           max_h,
-           total_pixels);
-}
-#endif
 
 static inline double now_sec(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec*1e-9; }
 static inline Interval I(float lo,float hi){ Interval r={lo,hi}; return r; }
@@ -216,8 +137,6 @@ static inline void build_worker_init(Worker* w){
     w->cur_tag=1;
     w->cur_mark=1;
 }
-
-static inline void render_worker_init(Worker* w){ (void)w; }
 
 static inline bool build_compact_tape_term(Worker* w, int fi, CompactTape* tp){
     int fr = frontier[fi];
@@ -497,29 +416,6 @@ static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
     }
 }
 
-static inline void eval_box_pixels(Worker* w, const WorkBox* wb){
-    eval_box_pixels_tp(w, &tapes[wb->tape_idx], wb->b);
-}
-
-static void build_tapes_and_boxes_omp(Worker* w){
-    Box local_boxes[MAX_BOXES_PER_TERM];
-    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
-    for(int i=0;i<nfrontier;i++){
-        CompactTape* tp = &tapes[i];
-        if(!build_compact_tape_term(w, i, tp)) continue;
-        int nb = multi_box_refine(w, tp, local_boxes);
-        if(nb > 0){
-            int base;
-            #pragma omp atomic capture
-            { base = nwork_boxes; nwork_boxes += nb; }
-            for(int k=0;k<nb;k++){
-                work_boxes[base + k].tape_idx = (uint16_t)i;
-                work_boxes[base + k].b = local_boxes[k];
-            }
-        }
-    }
-}
-
 static void process_terms_streaming_omp(Worker* w){
     int local_box_count = 0;
     Box local_boxes[MAX_BOXES_PER_TERM];
@@ -537,56 +433,19 @@ static void process_terms_streaming_omp(Worker* w){
     }
 }
 
-static int build_tapes_and_boxes_parallel(void){
-    nwork_boxes = 0;
-    #pragma omp parallel
-    {
-        Worker w; build_worker_init(&w);
-        build_tapes_and_boxes_omp(&w);
-    }
-    return nwork_boxes;
-}
-
-static void render_boxes_omp(Worker* w){
-    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
-    for(int i=0;i<nwork_boxes;i++) eval_box_pixels(w, &work_boxes[i]);
-}
-
-static void render_boxes_parallel(void){
-    memset(image, 0, sizeof(image));
-    #pragma omp parallel
-    {
-        Worker w; render_worker_init(&w);
-        render_boxes_omp(&w);
-    }
-}
-
 static void clear_image_omp(void){
-#if PARALLEL_CLEAR_IMAGE
     #pragma omp for schedule(static) nowait
     for(int i=0;i<IMAGE_W*IMAGE_H;i++) image[i] = 0;
-#else
-    #pragma omp single
-    memset(image, 0, sizeof(image));
-#endif
 }
 
 static void run_full_pipeline_omp(Worker* w){
-#if EXTRACT_FRONTIER_EACH_RUN
     #pragma omp single
     extract_frontier();
-#endif
-#if BUILD_BOXES_EACH_RUN
     #pragma omp single
     nwork_boxes = 0;
     clear_image_omp();
     #pragma omp barrier
     process_terms_streaming_omp(w);
-#else
-    clear_image_omp();
-    #pragma omp barrier
-    render_boxes_omp(w);
-#endif
     #pragma omp barrier
 }
 
@@ -596,97 +455,58 @@ static int checksum_image(void){
     return sum;
 }
 
-static int run_full_pipeline(void){
-#if EXTRACT_FRONTIER_EACH_RUN
-    extract_frontier();
-#endif
-#if BUILD_BOXES_EACH_RUN
-    nwork_boxes = 0;
-#if defined(PROFILE_PHASES)
-    double t_build_start = 0.0, t_build_end = 0.0;
-#endif
-#elif defined(PROFILE_PHASES)
-    double t_render_start = 0.0;
-#endif
-    memset(image, 0, sizeof(image));
+static void write_image_ppm(const char* path){
+    FILE* f = fopen(path, "wb");
+    if(!f){
+        perror("fopen");
+        exit(1);
+    }
+    fprintf(f, "P6\n%d %d\n255\n", IMAGE_W, IMAGE_H);
+    for(int y = IMAGE_H - 1; y >= 0; y--){
+        const uint8_t* row = &image[y * IMAGE_W];
+        for(int x = 0; x < IMAGE_W; x++){
+            uint8_t pixel[3] = { row[x], row[x], row[x] };
+            if(fwrite(pixel, sizeof(pixel), 1, f) != 1){
+                perror("fwrite");
+                fclose(f);
+                exit(1);
+            }
+        }
+    }
+    if(fclose(f) != 0){
+        perror("fclose");
+        exit(1);
+    }
+}
+
+static int run_full_pipeline_parallel(void){
     #pragma omp parallel
     {
-#if BUILD_BOXES_EACH_RUN
         Worker w;
         build_worker_init(&w);
-#if defined(PROFILE_PHASES)
-        render_worker_init(&w);
-        #pragma omp single
-        t_build_start = now_sec();
-        build_tapes_and_boxes_omp(&w);
-        #pragma omp barrier
-        #pragma omp single
-        {
-            t_build_end = now_sec();
-            g_profile_build_ms += (t_build_end - t_build_start) * 1000.0;
-        }
-        render_boxes_omp(&w);
-        #pragma omp barrier
-        #pragma omp single
-        g_profile_render_ms += (now_sec() - t_build_end) * 1000.0;
-#else
-        process_terms_streaming_omp(&w);
-#endif
-#else
-        Worker render_w;
-        render_worker_init(&render_w);
-#if defined(PROFILE_PHASES)
-        #pragma omp single
-        t_render_start = now_sec();
-        render_boxes_omp(&render_w);
-        #pragma omp barrier
-        #pragma omp single
-        g_profile_render_ms += (now_sec() - t_render_start) * 1000.0;
-#else
-        render_boxes_omp(&render_w);
-#endif
-#endif
+        run_full_pipeline_omp(&w);
     }
     return nwork_boxes;
 }
 
 int main(int argc, char** argv){ init_coords();
     const char* path = argc>1? argv[1] : "/mnt/data/prospero.vm";
+    const char* ppm_path = argc>2? argv[2] : NULL;
     load_vm(path);
-#if !EXTRACT_FRONTIER_EACH_RUN || !BUILD_BOXES_EACH_RUN
-    extract_frontier();
-#endif
-#if !BUILD_BOXES_EACH_RUN
-    build_tapes_and_boxes_parallel();
-#endif
     int max_threads=1;
     #ifdef _OPENMP
     max_threads = omp_get_max_threads();
     #endif
-    int warm_boxes = run_full_pipeline();
+    int warm_boxes = run_full_pipeline_parallel();
     int warm_sum = checksum_image();
-#ifdef PROFILE_STATS
-    print_work_stats();
-#endif
     printf("Full pipeline + frontier extraction + raster/eval benchmark\n");
     printf("instructions: %d\nfrontier_terms: %d\nimage: %dx%d\nmax_threads: %d\n", nins, nfrontier, IMAGE_W, IMAGE_H, max_threads);
     const int runs=BENCH_RUNS; double times[runs]; int boxes=-1, sum=-1;
-    #ifdef PROFILE_PHASES
-    for(int r=0;r<runs;r++){
-        double t0=now_sec();
-        boxes=run_full_pipeline();
-        double t1=now_sec();
-        times[r]=(t1-t0)*1000.0;
-        sum = checksum_image();
-        if(boxes!=warm_boxes || sum!=warm_sum){ fprintf(stderr,"mismatch boxes=%d/%d checksum=%d/%d\n", boxes, warm_boxes, sum, warm_sum); return 1; }
-    }
-    #else
     double timed_t0 = 0.0;
     #pragma omp parallel
     {
         Worker w;
         build_worker_init(&w);
-        render_worker_init(&w);
         for(int r=0;r<runs;r++){
             #pragma omp single
             timed_t0 = now_sec();
@@ -701,13 +521,10 @@ int main(int argc, char** argv){ init_coords();
             }
         }
     }
-    #endif
     double agg=0,minv=1e9,maxv=0; for(int i=0;i<runs;i++){ agg+=times[i]; if(times[i]<minv) minv=times[i]; if(times[i]>maxv) maxv=times[i]; }
     printf("threads=%d boxes=%d checksum=%d runs_ms:", max_threads, boxes, sum);
     for(int i=0;i<runs;i++) printf(" %.3f", times[i]);
     printf("\nmean_ms=%.3f min_ms=%.3f max_ms=%.3f\n", agg/runs, minv, maxv);
-#ifdef PROFILE_PHASES
-    printf("profile_mean_ms: build=%.3f render=%.3f\n", g_profile_build_ms / runs, g_profile_render_ms / runs);
-#endif
+    if(ppm_path) write_image_ppm(ppm_path);
     return 0;
 }
