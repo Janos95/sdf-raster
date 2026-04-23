@@ -94,7 +94,10 @@ static int parse_op(const char* s){
 static int lookup_id(const char* s){ for(int i=0;i<nids;i++) if(!strcmp(ids[i].key,s)) return ids[i].idx; return -1; }
 static void add_id(const char* s,int idx){ strcpy(ids[nids].key,s); ids[nids].idx=idx; nids++; }
 
-static void init_coords(void){ for(int i=0;i<IMAGE_W;i++) gxcoords[i]=((float)i+0.5f)*(2.0f/(float)IMAGE_W)-1.0f; for(int i=0;i<IMAGE_H;i++) gycoords[i]=((float)i+0.5f)*(2.0f/(float)IMAGE_H)-1.0f; }
+static void init_coords(void){
+    for(int i=0;i<IMAGE_W;i++) gxcoords[i] = -1.0f + 2.0f * (float)i / (float)(IMAGE_W - 1);
+    for(int i=0;i<IMAGE_H;i++) gycoords[i] = -1.0f + 2.0f * (float)i / (float)(IMAGE_H - 1);
+}
 
 static void load_vm(const char* path){
     FILE* f=fopen(path,"r"); if(!f){ perror("fopen"); exit(1);} char line[256];
@@ -241,7 +244,12 @@ static inline bool contract_once(Worker* w, const CompactTape* tp, Box domain, B
             case OP_SQUARE: { float s=sqrtf(fmaxf(0.0f,z.hi)); upd_desired(w,in.a,I(-s,s),xa);} break;
             case OP_SQRT: if(z.hi>=0.0f){ float zl=fmaxf(0.0f,z.lo), zh=fmaxf(0.0f,z.hi); upd_desired(w,in.a,I(zl*zl,zh*zh),xa);} break;
             case OP_MAX: upd_desired(w,in.a,I(NEG_INF,z.hi),xa); upd_desired(w,in.b,I(NEG_INF,z.hi),xb); break;
-            case OP_MIN: upd_desired(w,in.a,I(NEG_INF,z.hi),xa); upd_desired(w,in.b,I(NEG_INF,z.hi),xb); break;
+            case OP_MIN:
+                upd_desired(w,in.a,I(z.lo,xa.hi),xa);
+                upd_desired(w,in.b,I(z.lo,xb.hi),xb);
+                if(xa.lo > z.hi) upd_desired(w,in.b,I(NEG_INF,z.hi),xb);
+                if(xb.lo > z.hi) upd_desired(w,in.a,I(NEG_INF,z.hi),xa);
+                break;
         }
     }
     int xl=tp->xlocal, yl=tp->ylocal;
@@ -287,12 +295,12 @@ static inline int multi_box_refine(Worker* w, const CompactTape* tp, Box* out_bo
 static inline int clampi(int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); }
 
 static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
-    int x0 = clampi((int)floorf((b.x0 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W-1);
-    int x1 = clampi((int)ceilf ((b.x1 + 1.0f) * 0.5f * IMAGE_W), 0, IMAGE_W);
-    int y0 = clampi((int)floorf((b.y0 + 1.0f) * 0.5f * IMAGE_H), 0, IMAGE_H-1);
-    int y1 = clampi((int)ceilf ((b.y1 + 1.0f) * 0.5f * IMAGE_H), 0, IMAGE_H);
-    if(x1 <= x0 || y1 <= y0) return;
-    int width = x1 - x0;
+    int x0 = clampi((int)ceilf ((b.x0 + 1.0f) * 0.5f * (IMAGE_W - 1)), 0, IMAGE_W);
+    int x1 = clampi((int)floorf((b.x1 + 1.0f) * 0.5f * (IMAGE_W - 1)), -1, IMAGE_W - 1);
+    int y0 = clampi((int)ceilf ((b.y0 + 1.0f) * 0.5f * (IMAGE_H - 1)), 0, IMAGE_H);
+    int y1 = clampi((int)floorf((b.y1 + 1.0f) * 0.5f * (IMAGE_H - 1)), -1, IMAGE_H - 1);
+    if(x1 < x0 || y1 < y0) return;
+    int width = x1 - x0 + 1;
 
     for(int vi=0; vi<tp->nxops; vi++){
         int v = tp->xops[vi];
@@ -352,7 +360,7 @@ static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
         }
     }
 
-    for(int py = y0; py < y1; py++){
+    for(int py = y0; py <= y1; py++){
         float yv = gycoords[py];
         for(int vi=0; vi<tp->nyops; vi++){
             int v = tp->yops[vi];
@@ -412,7 +420,7 @@ static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
         const float *rootv = w->vals[tp->root];
         uint8_t *row = &image[py * IMAGE_W + x0];
         #pragma omp simd
-        for(int ix=0; ix<width; ix++) if(rootv[ix] < 0.0f) row[ix] = 254;
+        for(int ix=0; ix<width; ix++) if(rootv[ix] < 0.0f) row[ix] = 255;
     }
 }
 
