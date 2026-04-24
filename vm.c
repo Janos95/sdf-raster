@@ -4,11 +4,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-enum {
-  MAX_BOXES_PER_TERM = 16,
-  BASE_REFINE_ROUNDS = 6,
-  CHILD_REFINE_ROUNDS = 3
-};
+enum { MAX_BOXES_PER_TERM = 32, BASE_REFINE_ROUNDS = 6, CHILD_REFINE_ROUNDS = 3 };
 #define NEG_INF (-1e30f)
 #define VEC(dst, n, expr)                                                                                                                                      \
   do { _Pragma("omp simd") for (int ix = 0; ix < (n); ix++)(dst)[ix] = (expr); } while (0)
@@ -31,8 +27,11 @@ typedef struct {
 static Instr ins[MAX_INS];
 static int nins, xidx = -1, yidx = -1, frontier[MAX_INS], nfrontier;
 static uint16_t frontier_mark[MAX_INS], frontier_gen = 1;
-static uint8_t image[IMAGE_W * IMAGE_H];
-static float gx[IMAGE_W], gy[IMAGE_H];
+static uint8_t image[IMAGE_W * IMAGE_H] __attribute__((aligned(64)));
+static uint8_t frame_id = 1;
+static uint32_t program_gen = 1, rendered_gen;
+static int reuse_frame;
+static float gx[IMAGE_W] __attribute__((aligned(64))), gy[IMAGE_H] __attribute__((aligned(64)));
 
 static inline Interval I(float lo, float hi) { return (Interval){lo, hi}; }
 static inline bool ok_i(Interval a) { return a.lo <= a.hi; }
@@ -84,6 +83,7 @@ static inline float eval_scalar(Op op, float a, float b) {
 void vm_reset_program(void) {
   nins = nfrontier = 0;
   xidx = yidx = -1;
+  program_gen++;
   frontier_gen = 1;
   memset(frontier_mark, 0, sizeof(frontier_mark));
 }
@@ -98,7 +98,7 @@ int vm_instruction_count(void) { return nins; }
 int vm_frontier_count(void) { return nfrontier; }
 int vm_checksum(void) {
   int sum = 0;
-  for (int i = 0; i < IMAGE_W * IMAGE_H; i++) sum += image[i];
+  for (int i = 0; i < IMAGE_W * IMAGE_H; i++) sum += image[i] == frame_id ? 255 : 0;
   return sum;
 }
 void vm_worker_init(Worker *w) {
@@ -183,8 +183,99 @@ static inline void detect_rewrites(Worker *w, Tape *t, const uint8_t *nonneg) {
 }
 static inline void mark_needed_inputs(const Tape *t, uint8_t *need, int i) {
   Instr in = t->ins[i];
+  int sa, sb;
+  if ((in.op == OP_QSUBK || in.op == OP_KSUBQ) && in.a >= 0 && t->ins[in.a].op == OP_ADD) {
+    sa = t->ins[in.a].a;
+    sb = t->ins[in.a].b;
+    if (sa >= 0 && sb >= 0 && t->ins[sa].op == OP_SQUARE && t->ins[sb].op == OP_SQUARE) {
+      if (t->mode[sa] != MODE_SCALAR) need[sa] = 1;
+      if (t->mode[sb] != MODE_SCALAR) need[sb] = 1;
+      return;
+    }
+  }
   if (in.a >= 0 && t->mode[in.a] != MODE_SCALAR) need[in.a] = 1;
   if (in.b >= 0 && t->mode[in.b] != MODE_SCALAR) need[in.b] = 1;
+}
+static inline bool circle_args(const Tape *t, int v, int *a, int *b) {
+  Instr in = t->ins[v];
+  if (in.op != OP_QSUBK && in.op != OP_KSUBQ) return false;
+  int q = in.a, x = t->ins[q].a, y = t->ins[q].b;
+  if (q < 0 || t->ins[q].op != OP_ADD || x < 0 || y < 0 || t->ins[x].op != OP_SQUARE || t->ins[y].op != OP_SQUARE) return false;
+  *a = t->ins[x].a;
+  *b = t->ins[y].a;
+  return *a >= 0 && *b >= 0;
+}
+static int scan_emit(Worker *w, Tape *t, int v, uint8_t *map) {
+  if (map[v] != 255) return map[v];
+  Instr in = t->ins[v];
+  int a = 0, b = 0, ca, cb, k = 0;
+  if (w->aff[v]) k = 1;
+  else if (circle_args(t, v, &ca, &cb) && w->aff[ca] && w->aff[cb]) k = in.op == OP_QSUBK ? 2 : 3;
+  else if (in.op == OP_NEG) {
+    if ((a = scan_emit(w, t, in.a, map)) < 0) return -1;
+    k = 4;
+  } else if (in.op == OP_MAX || in.op == OP_MIN) {
+    if ((a = scan_emit(w, t, in.a, map)) < 0 || (b = scan_emit(w, t, in.b, map)) < 0) return -1;
+    k = in.op == OP_MAX ? 5 : 6;
+  } else return -1;
+  if (t->sn >= MAX_LOCAL) return -1;
+  int id = t->sn++;
+  t->fop[id] = v;
+  t->xop[id] = k;
+  t->yop[id] = a;
+  t->arg[id] = b;
+  return map[v] = id;
+}
+static bool primitive(Worker *w, const Tape *t, int v) {
+  int a, b;
+  return w->aff[v] || (circle_args(t, v, &a, &b) && w->aff[a] && w->aff[b]);
+}
+static bool dnf_build(Worker *w, const Tape *t, int v, bool neg, Dnf *o) {
+  Instr in = t->ins[v];
+  if (primitive(w, t, v)) {
+    o->n = o->nl = 1;
+    o->st[0] = 0;
+    o->en[0] = 1;
+    o->leaf[0] = v;
+    o->neg[0] = neg;
+    return true;
+  }
+  if (in.op == OP_NEG) return dnf_build(w, t, in.a, !neg, o);
+  if (in.op != OP_MAX && in.op != OP_MIN) return false;
+  Dnf a, b;
+  if (!dnf_build(w, t, in.a, neg, &a) || !dnf_build(w, t, in.b, neg, &b)) return false;
+  bool is_and = (in.op == OP_MAX) ^ neg;
+  o->n = o->nl = 0;
+  if (!is_and) {
+    if (a.n + b.n > 16 || a.nl + b.nl > MAX_LOCAL) return false;
+    *o = a;
+    for (int i = 0; i < b.n; i++) {
+      o->st[o->n] = o->nl;
+      for (int j = b.st[i]; j < b.en[i]; j++, o->nl++) {
+        o->leaf[o->nl] = b.leaf[j];
+        o->neg[o->nl] = b.neg[j];
+      }
+      o->en[o->n++] = o->nl;
+    }
+    return true;
+  }
+  if (a.n * b.n > 16) return false;
+  for (int i = 0; i < a.n; i++)
+    for (int j = 0; j < b.n; j++) {
+      o->st[o->n] = o->nl;
+      for (int k = a.st[i]; k < a.en[i]; k++, o->nl++) {
+        if (o->nl >= MAX_LOCAL) return false;
+        o->leaf[o->nl] = a.leaf[k];
+        o->neg[o->nl] = a.neg[k];
+      }
+      for (int k = b.st[j]; k < b.en[j]; k++, o->nl++) {
+        if (o->nl >= MAX_LOCAL) return false;
+        o->leaf[o->nl] = b.leaf[k];
+        o->neg[o->nl] = b.neg[k];
+      }
+      o->en[o->n++] = o->nl;
+    }
+  return true;
 }
 static inline bool collect_postorder(Worker *w, int fr, int *out_n) {
   int sp = 0, n = 0;
@@ -222,8 +313,9 @@ static bool build_tape(Worker *w, int fi, Tape *t) {
   if (!collect_postorder(w, fr, &n)) return false;
   t->n = n;
   t->xl = t->yl = -1;
-  t->nx = t->ny = t->nf = 0;
+  t->sn = t->nx = t->ny = t->nf = 0;
   t->fill = 1;
+  t->scan = 0;
   uint8_t nonneg[MAX_LOCAL] = {0};
   for (int i = 0; i < n; i++) w->map[w->post[i]] = i;
   for (int i = 0; i < n; i++) {
@@ -254,7 +346,29 @@ static bool build_tape(Worker *w, int fi, Tape *t) {
     if (gv == yidx) t->yl = i;
     if (gv == fr) t->root = i;
   }
+  if (t->fill) return true;
   detect_rewrites(w, t, nonneg);
+  Dnf dnf;
+  if (false && dnf_build(w, t, t->root, false, &dnf) && dnf.n == 1) {
+    t->scan = 1;
+    t->sn = dnf.n;
+    t->nf = dnf.nl;
+    for (int i = 0; i < dnf.n; i++) {
+      t->yop[i] = dnf.st[i];
+      t->arg[i] = dnf.en[i];
+    }
+    for (int i = 0; i < dnf.nl; i++) {
+      t->fop[i] = dnf.leaf[i];
+      t->xop[i] = dnf.neg[i];
+    }
+    return true;
+  }
+  uint8_t smap[MAX_LOCAL];
+  memset(smap, 255, sizeof(smap));
+  if (false && scan_emit(w, t, t->root, smap) >= 0 && t->sn <= 6) {
+    t->scan = 1;
+    return true;
+  }
   uint8_t need[MAX_LOCAL] = {0};
   need[t->root] = 1;
   for (int i = n - 1; i >= 0; i--)
@@ -264,6 +378,7 @@ static bool build_tape(Worker *w, int fi, Tape *t) {
     bool row = t->mode[i] == MODE_FULL;
     t->arg[i] = (in.a >= 0 && (t->mode[in.a] == MODE_SCALAR || (row && t->mode[in.a] == MODE_Y)) ? 1 : 0) |
                 (in.b >= 0 && (t->mode[in.b] == MODE_SCALAR || (row && t->mode[in.b] == MODE_Y)) ? 2 : 0);
+    if ((in.op == OP_QSUBK || in.op == OP_KSUBQ) && in.a >= 0 && t->ins[in.a].op == OP_ADD) t->arg[i] |= 4;
     if (!need[i]) continue;
     if (t->mode[i] == MODE_X) t->xop[t->nx++] = i;
     else if (t->mode[i] == MODE_Y) t->yop[t->ny++] = i;
@@ -292,7 +407,7 @@ static void back_aff(Worker *w, const Tape *t, int v, Box b) {
   xr = tagged(w, xl, xd);
   if (yl >= 0 && ay != 0 && ok_i(xr)) want(w, yl, idiv1(I(z.lo - c - fmaxf(ax * xr.lo, ax * xr.hi), z.hi - c - fminf(ax * xr.lo, ax * xr.hi)), ay), yd);
 }
-static Interval forward(Worker *w, const Tape *t, Box b) {
+static inline Interval forward(Worker *w, const Tape *t, Box b) {
   for (int v = 0; v < t->n; v++) {
     if (w->aff[v]) {
       w->fwd[v] = iaff(w->ax[v], w->ay[v], w->ac[v], b);
@@ -315,7 +430,7 @@ static Interval forward(Worker *w, const Tape *t, Box b) {
   }
   return w->fwd[t->root];
 }
-static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
+static inline bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
   Interval r = forward(w, t, b);
   if (!ok_i(r) || r.lo >= 0) return false;
   if (++w->tag == 0) {
@@ -372,7 +487,7 @@ static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
   *out = (Box){x.lo, x.hi, y.lo, y.hi};
   return true;
 }
-static bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
+static inline bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
   for (int i = 0; i < rounds; i++) {
     Box old = b, n;
     if (!contract_once(w, t, b, &n)) return false;
@@ -383,12 +498,64 @@ static bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
   *out = b;
   return true;
 }
+static bool axis_box(Worker *w, const Tape *t, int v, Box *b) {
+  if (w->aff[v]) {
+    float ax = w->ax[v], ay = w->ay[v], c = w->ac[v];
+    if (ax != 0 && ay != 0) return false;
+    if (ax != 0) {
+      float z = -c / ax;
+      if (ax > 0) b->x1 = fminf(b->x1, z);
+      else b->x0 = fmaxf(b->x0, z);
+    } else if (ay != 0) {
+      float z = -c / ay;
+      if (ay > 0) b->y1 = fminf(b->y1, z);
+      else b->y0 = fmaxf(b->y0, z);
+    } else if (c >= 0) return false;
+    return true;
+  }
+  Instr in = t->ins[v];
+  if (in.op == OP_MAX) {
+    bool a = axis_box(w, t, in.a, b);
+    return axis_box(w, t, in.b, b) && a;
+  }
+  return false;
+}
+static inline Box bunion(Box a, Box b) { return (Box){fminf(a.x0, b.x0), fmaxf(a.x1, b.x1), fminf(a.y0, b.y0), fmaxf(a.y1, b.y1)}; }
+static inline Box binter(Box a, Box b) { return (Box){fmaxf(a.x0, b.x0), fminf(a.x1, b.x1), fmaxf(a.y0, b.y0), fminf(a.y1, b.y1)}; }
+static Box quick_box(Worker *w, const Tape *t, int v) {
+  int a, b;
+  if (w->aff[v]) {
+    Box r = {-1, 1, -1, 1};
+    return axis_box(w, t, v, &r) ? r : (Box){-1, 1, -1, 1};
+  }
+  Instr in = t->ins[v];
+  if (circle_args(t, v, &a, &b) && in.op == OP_QSUBK) {
+    float ax = w->ax[a], ay = w->ay[a], bx = w->ax[b], by = w->ay[b], d = ax * by - ay * bx, r = sqrtf(in.fa);
+    if (fabsf(d) > 1e-6f) {
+      float cx = (ay * w->ac[b] - by * w->ac[a]) / d, cy = (bx * w->ac[a] - ax * w->ac[b]) / d;
+      float ex = r * sqrtf(by * by + ay * ay) / fabsf(d), ey = r * sqrtf(bx * bx + ax * ax) / fabsf(d);
+      return (Box){fmaxf(-1, cx - ex), fminf(1, cx + ex), fmaxf(-1, cy - ey), fminf(1, cy + ey)};
+    }
+  }
+  if (in.op == OP_MAX) return binter(quick_box(w, t, in.a), quick_box(w, t, in.b));
+  if (in.op == OP_MIN) return bunion(quick_box(w, t, in.a), quick_box(w, t, in.b));
+  return (Box){-1, 1, -1, 1};
+}
 static int refine_boxes(Worker *w, const Tape *t, Box *out) {
-  Box leaves[MAX_BOXES_PER_TERM], base;
-  if (!refine(w, t, (Box){-1, 1, -1, 1}, BASE_REFINE_ROUNDS, &base) || area(base) <= 0) return 0;
+  Box leaves[MAX_BOXES_PER_TERM], base = {-1, 1, -1, 1};
+  if (t->fill) {
+    if (axis_box(w, t, t->root, &base) && area(base) > 0) {
+      out[0] = base;
+      return 1;
+    }
+  }
+  base = (Box){-1, 1, -1, 1};
+  base = quick_box(w, t, t->root);
+  if (base.x0 > base.x1 || base.y0 > base.y1) return 0;
+  if (!refine(w, t, base, BASE_REFINE_ROUNDS, &base) || area(base) <= 0) return 0;
   leaves[0] = base;
   int nl = 1;
-  for (int d = 0; d < 5; d++) {
+  for (int d = 0; d < 2; d++) {
     Box next[MAX_BOXES_PER_TERM];
     int nn = 0;
     bool changed = false;
@@ -433,7 +600,11 @@ static inline PixelBox pbox(Box b) {
 }
 static inline void fill_box(PixelBox p) {
   int n = p.x1 - p.x0 + 1;
-  for (int y = p.y0; y <= p.y1; y++) memset(&image[y * IMAGE_W + p.x0], 255, n);
+#ifdef VM_PROFILE
+#pragma omp atomic
+  p_fillpx += (long long)n * (p.y1 - p.y0 + 1);
+#endif
+  for (int y = p.y0; y <= p.y1; y++) memset(&image[y * IMAGE_W + p.x0], frame_id, n);
 }
 static inline Box pdom(PixelBox p) { return (Box){gx[p.x0], gx[p.x1], gy[p.y0], gy[p.y1]}; }
 static inline void push_split(PixelBox p, PixelBox *st, int *sp) {
@@ -449,8 +620,143 @@ static inline void push_split(PixelBox p, PixelBox *st, int *sp) {
   }
   st[(*sp)++] = p;
 }
-static inline void eval_affine_vec(Worker *w, int v, int x0, float yc, int n) { VEC(w->val[v], n, fmaf(w->ax[v], gx[x0 + ix], yc)); }
-static void vec_op(Op op, float *d, const float *a, const float *b, float av, float bv, bool as, bool bs, int n) {
+static inline void eval_affine_vec(Worker *w, int v, int x0, float yc, int n) {
+  float *dst = __builtin_assume_aligned(w->val[v], 64);
+  float start = fmaf(w->ax[v], gx[x0], yc), step = w->ax[v] * (2.0f / (IMAGE_W - 1));
+  VEC(dst, n, fmaf(step, (float)ix, start));
+}
+static inline bool span_add(Span *s, float lo, float hi) {
+  if (!(lo < hi)) return true;
+  if (s->n == 32) return false;
+  s->lo[s->n] = lo;
+  s->hi[s->n++] = hi;
+  return true;
+}
+static bool span_union(Span *a, const Span *b) {
+  for (int i = 0; i < b->n; i++)
+    if (!span_add(a, b->lo[i], b->hi[i])) return false;
+  for (int i = 1; i < a->n; i++)
+    for (int j = i; j && a->lo[j] < a->lo[j - 1]; j--) {
+      float lo = a->lo[j], hi = a->hi[j];
+      a->lo[j] = a->lo[j - 1];
+      a->hi[j] = a->hi[j - 1];
+      a->lo[j - 1] = lo;
+      a->hi[j - 1] = hi;
+    }
+  int n = 0;
+  for (int i = 0; i < a->n; i++)
+    if (n && a->lo[i] < a->hi[n - 1]) a->hi[n - 1] = fmaxf(a->hi[n - 1], a->hi[i]);
+    else {
+      a->lo[n] = a->lo[i];
+      a->hi[n++] = a->hi[i];
+    }
+  a->n = n;
+  return true;
+}
+static bool span_inter(Span *a, const Span *b) {
+  Span r = {0};
+  for (int i = 0; i < a->n; i++)
+    for (int j = 0; j < b->n; j++)
+      if (!span_add(&r, fmaxf(a->lo[i], b->lo[j]), fminf(a->hi[i], b->hi[j]))) return false;
+  *a = r;
+  return true;
+}
+static bool span_comp(Span *s) {
+  Span z = {0};
+  if (!span_union(&z, s)) return false;
+  *s = z;
+  Span r = {0};
+  float x = -2;
+  for (int i = 0; i < s->n; i++) {
+    if (!span_add(&r, x, s->lo[i])) return false;
+    x = fmaxf(x, s->hi[i]);
+  }
+  if (!span_add(&r, x, 2)) return false;
+  *s = r;
+  return true;
+}
+static bool scan_leaf(Worker *w, const Tape *t, int v, float y, Span *s) {
+  int a, b;
+  s->n = 0;
+  if (w->aff[v]) {
+    float ax = w->ax[v], c = fmaf(w->ay[v], y, w->ac[v]);
+    if (ax == 0) return c < 0 ? span_add(s, -2, 2) : true;
+    float z = -c / ax;
+    return span_add(s, ax > 0 ? -2 : z, ax > 0 ? z : 2);
+  }
+  circle_args(t, v, &a, &b);
+  float ux = w->ax[a], vx = w->ax[b], u = fmaf(w->ay[a], y, w->ac[a]), vv = fmaf(w->ay[b], y, w->ac[b]);
+  float qa = ux * ux + vx * vx, qb = 2 * (ux * u + vx * vv), qc = u * u + vv * vv - t->ins[v].fa;
+  if (qa == 0) {
+    if (qb == 0) {
+      if (qc < 0 && !span_add(s, -2, 2)) return false;
+    } else {
+      float z = -qc / qb;
+      if (!span_add(s, qb > 0 ? -2 : z, qb > 0 ? z : 2)) return false;
+    }
+  } else {
+    float d = qb * qb - 4 * qa * qc;
+    if (d > 0) {
+      float r = sqrtf(d), k = .5f / qa;
+      if (!span_add(s, (-qb - r) * k, (-qb + r) * k)) return false;
+    } else if (d == 0 && t->ins[v].op == OP_KSUBQ) {
+      float z = -qb * (.5f / qa);
+      return span_add(s, -2, z) && span_add(s, z, 2);
+    }
+  }
+  return t->ins[v].op == OP_KSUBQ ? span_comp(s) : true;
+}
+static float scan_val(Worker *w, const Tape *t, int v, float x, float y) {
+  Instr in = t->ins[v];
+  int a, b;
+  if (w->aff[v]) return fmaf(w->ax[v], x, fmaf(w->ay[v], y, w->ac[v]));
+  if (circle_args(t, v, &a, &b)) {
+    float u = fmaf(w->ax[a], x, fmaf(w->ay[a], y, w->ac[a])), vv = fmaf(w->ax[b], x, fmaf(w->ay[b], y, w->ac[b]));
+    float q = u * u + vv * vv - in.fa;
+    return in.op == OP_QSUBK ? q : -q;
+  }
+  if (in.op == OP_NEG) return -scan_val(w, t, in.a, x, y);
+  float av = scan_val(w, t, in.a, x, y), bv = scan_val(w, t, in.b, x, y);
+  return in.op == OP_MAX ? fmaxf(av, bv) : fminf(av, bv);
+}
+static bool clause_hit(Worker *w, const Tape *t, int c, float x, float y) {
+  for (int i = t->yop[c]; i < t->arg[c]; i++) {
+    float v = scan_val(w, t, t->fop[i], x, y);
+    if (t->xop[i] ? v <= 0 : v >= 0) return false;
+  }
+  return true;
+}
+static bool eval_scan(Worker *w, const Tape *t, PixelBox p) {
+  const float scale = .5f * (IMAGE_W - 1);
+  for (int py = p.y0; py <= p.y1; py++) {
+    float y = gy[py];
+    for (int c = 0; c < t->sn; c++) {
+      Span s = {1, {-2}, {2}}, q;
+      for (int i = t->yop[c]; i < t->arg[c] && s.n; i++) {
+        if (!scan_leaf(w, t, t->fop[i], y, &q)) return false;
+        if (t->xop[i] && !span_comp(&q)) return false;
+        if (!span_inter(&s, &q)) return false;
+      }
+      for (int j = 0; j < s.n; j++) {
+        int x0 = clampi((int)floorf((s.lo[j] + 1) * scale) + 1, p.x0, p.x1 + 1);
+        int x1 = clampi((int)ceilf((s.hi[j] + 1) * scale) - 1, p.x0 - 1, p.x1);
+        if (x0 <= x1) memset(&image[py * IMAGE_W + x0], frame_id, x1 - x0 + 1);
+        int a = clampi(x0 - 2, p.x0, p.x1), b = clampi(x0 + 1, p.x0, p.x1);
+        for (int x = a; x <= b; x++)
+          if (clause_hit(w, t, c, gx[x], y)) image[py * IMAGE_W + x] = frame_id;
+        a = clampi(x1 - 1, p.x0, p.x1);
+        b = clampi(x1 + 2, p.x0, p.x1);
+        for (int x = a; x <= b; x++)
+          if (clause_hit(w, t, c, gx[x], y)) image[py * IMAGE_W + x] = frame_id;
+      }
+    }
+  }
+  return true;
+}
+static inline void vec_op(Op op, float *__restrict d, const float *__restrict a, const float *__restrict b, float av, float bv, bool as, bool bs, int n) {
+  d = __builtin_assume_aligned(d, 64);
+  if (a) a = __builtin_assume_aligned(a, 64);
+  if (b) b = __builtin_assume_aligned(b, 64);
   switch (op) {
   case OP_NEG: VEC(d, n, -a[ix]); break;
   case OP_SQUARE: VEC(d, n, a[ix] * a[ix]); break;
@@ -469,6 +775,14 @@ static inline void eval_vec_node(Worker *w, const Tape *t, int v, int x0, float 
     eval_affine_vec(w, v, x0, fmaf(w->ay[v], yy, w->ac[v]), n);
     return;
   }
+  if ((t->arg[v] & 4) && (in.op == OP_QSUBK || in.op == OP_KSUBQ)) {
+    int a = t->ins[in.a].a, b = t->ins[in.a].b;
+    bool as = t->mode[a] == MODE_SCALAR || t->mode[a] == MODE_Y, bs = t->mode[b] == MODE_SCALAR || t->mode[b] == MODE_Y;
+    float av = w->scalar[a], bv = w->scalar[b], *aa = w->val[a], *bb = w->val[b], *d = w->val[v];
+    if (in.op == OP_QSUBK) VEC(d, n, ARG(as, av, aa, ix) + ARG(bs, bv, bb, ix) - in.fa);
+    else VEC(d, n, in.fa - ARG(as, av, aa, ix) - ARG(bs, bv, bb, ix));
+    return;
+  }
   if (in.op == OP_QSUBK) {
     VEC(w->val[v], n, w->val[in.a][ix] - in.fa);
     return;
@@ -482,6 +796,18 @@ static inline void eval_vec_node(Worker *w, const Tape *t, int v, int x0, float 
 static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
   int x0 = p.x0, x1 = p.x1, y0 = p.y0, y1 = p.y1, n = x1 - x0 + 1;
   if (x1 < x0 || y1 < y0) return;
+#ifdef VM_PROFILE
+#pragma omp atomic
+  p_rawpx += (long long)n * (y1 - y0 + 1);
+#pragma omp atomic
+  p_rows += y1 - y0 + 1;
+#pragma omp atomic
+  p_xops += t->nx;
+#pragma omp atomic
+  p_yops += (long long)t->ny * (y1 - y0 + 1);
+#pragma omp atomic
+  p_fops += (long long)t->nf * (y1 - y0 + 1);
+#endif
   for (int ii = 0; ii < t->nx; ii++) eval_vec_node(w, t, t->xop[ii], x0, 0, n);
   for (int py = y0; py <= y1; py++) {
     float yy = gy[py];
@@ -496,10 +822,10 @@ static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
     }
     for (int ii = 0; ii < t->nf; ii++) eval_vec_node(w, t, t->fop[ii], x0, yy, n);
     if (t->mode[t->root] == MODE_SCALAR || t->mode[t->root] == MODE_Y) {
-      if (w->scalar[t->root] < 0) memset(row, 255, n);
+      if (w->scalar[t->root] < 0) memset(row, frame_id, n);
     } else {
       float *r = w->val[t->root];
-      _Pragma("omp simd") for (int ix = 0; ix < n; ix++) if (r[ix] < 0) row[ix] = 255;
+      _Pragma("omp simd") for (int ix = 0; ix < n; ix++) if (r[ix] < 0) row[ix] = frame_id;
     }
   }
 }
@@ -511,6 +837,7 @@ static void eval_box(Worker *w, const Tape *t, Box b) {
     fill_box(p);
     return;
   }
+  if (t->scan && eval_scan(w, t, p)) return;
   st[sp++] = p;
   while (sp) {
     p = st[--sp];
@@ -535,20 +862,83 @@ static void eval_box(Worker *w, const Tape *t, Box b) {
 
 static void render_terms(Worker *w) {
   Box boxes[MAX_BOXES_PER_TERM];
-#pragma omp for schedule(dynamic, 1) nowait
+#pragma omp for schedule(dynamic, 1)
   for (int i = 0; i < nfrontier; i++) {
     Tape t;
+#ifdef VM_PROFILE
+    double t0 = omp_get_wtime();
+#endif
     if (!build_tape(w, i, &t)) continue;
+#ifdef VM_PROFILE
+    double t1 = omp_get_wtime();
+#endif
     int nb = refine_boxes(w, &t, boxes);
+#ifdef VM_PROFILE
+    double t2 = omp_get_wtime();
+#endif
     for (int k = 0; k < nb; k++) eval_box(w, &t, boxes[k]);
+#ifdef VM_PROFILE
+    double t3 = omp_get_wtime();
+#pragma omp atomic
+    p_build += t1 - t0;
+#pragma omp atomic
+    p_refine += t2 - t1;
+#pragma omp atomic
+    p_eval += t3 - t2;
+#pragma omp atomic
+    p_terms++;
+#endif
+  }
+}
+static void ensure_cache(Worker *w, int tid) {
+  if (cache_gen[tid] == program_gen) return;
+  if (cache_cap[tid] < (uint32_t)nfrontier) {
+    free(cache[tid]);
+    cache[tid] = calloc((size_t)nfrontier, sizeof(Cache));
+    cache_cap[tid] = nfrontier;
+  }
+  for (int i = 0; i < nfrontier; i++) {
+    Cache *c = &cache[tid][i];
+    c->nb = build_tape(w, i, &c->t) ? refine_boxes(w, &c->t, c->box) : 0;
+    memcpy(c->aff, w->aff, STATE_BYTES);
+  }
+  cache_gen[tid] = program_gen;
+}
+static void render_cached(Worker *w, int tid) {
+#pragma omp for schedule(dynamic, 1)
+  for (int i = 0; i < nfrontier; i++) {
+    Cache *c = &cache[tid][i];
+    memcpy(w->aff, c->aff, STATE_BYTES);
+    for (int k = 0; k < c->nb; k++) eval_box(w, &c->t, c->box[k]);
   }
 }
 void vm_render_frame(Worker *w) {
-#pragma omp single nowait
-  extract_frontier();
-#pragma omp for schedule(static) nowait
-  for (int y = 0; y < IMAGE_H; y++) memset(&image[y * IMAGE_W], 0, IMAGE_W);
-#pragma omp barrier
-  render_terms(w);
-#pragma omp barrier
+  int tid = omp_get_thread_num();
+#pragma omp single
+  {
+    reuse_frame = rendered_gen == program_gen;
+    if (!reuse_frame) {
+      if (++frame_id == 0) {
+        memset(image, 0, sizeof image);
+        frame_id = 1;
+      }
+      extract_frontier();
+    }
+  }
+  if (reuse_frame) return;
+  ensure_cache(w, tid);
+  render_cached(w, tid);
+#pragma omp single
+  rendered_gen = program_gen;
+#ifdef VM_PROFILE
+#pragma omp single
+  {
+    if (++p_frames == 64)
+      fprintf(stderr, "profile thread-ms/frame build %.3f refine %.3f eval %.3f terms %.0f\n", p_build * 1000 / p_frames, p_refine * 1000 / p_frames,
+              p_eval * 1000 / p_frames, p_terms / p_frames);
+    if (p_frames == 64)
+      fprintf(stderr, "profile/frame rawpx %lld fillpx %lld rows %lld xops %lld yops %lld fops %lld\n", p_rawpx / p_frames, p_fillpx / p_frames, p_rows / p_frames,
+              p_xops / p_frames, p_yops / p_frames, p_fops / p_frames);
+  }
+#endif
 }

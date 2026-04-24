@@ -25,7 +25,7 @@ typedef struct Worker {
   uint16_t want_tag[MAX_LOCAL], mark[MAX_INS], map[MAX_INS], tag, mark_id;
   int post[MAX_LOCAL], stack[MAX_LOCAL * 2];
   uint8_t aff[MAX_LOCAL];
-  float ax[MAX_LOCAL], ay[MAX_LOCAL], ac[MAX_LOCAL], scalar[MAX_LOCAL], val[MAX_LOCAL][IMAGE_W + 8] __attribute__((aligned(64)));
+  float ax[MAX_LOCAL], ay[MAX_LOCAL], ac[MAX_LOCAL], scalar[MAX_LOCAL], val[MAX_LOCAL][IMAGE_W + 16] __attribute__((aligned(64)));
 } Worker;
 
 void vm_reset_program(void);
