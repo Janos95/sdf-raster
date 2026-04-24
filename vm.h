@@ -8,6 +8,7 @@ enum {
   MAX_LOCAL = 128,
   IMAGE_W = 1024,
   IMAGE_H = 1024,
+  VAL_STRIDE = IMAGE_W + 16,
   BENCH_RUNS = 32
 };
 
@@ -25,7 +26,7 @@ typedef struct Worker {
   uint16_t want_tag[MAX_LOCAL], mark[MAX_INS], map[MAX_INS], tag, mark_id;
   int post[MAX_LOCAL], stack[MAX_LOCAL * 2];
   uint8_t aff[MAX_LOCAL];
-  float ax[MAX_LOCAL], ay[MAX_LOCAL], ac[MAX_LOCAL], scalar[MAX_LOCAL], val[MAX_LOCAL][IMAGE_W + 8] __attribute__((aligned(64)));
+  float ax[MAX_LOCAL], ay[MAX_LOCAL], ac[MAX_LOCAL], scalar[MAX_LOCAL], val[MAX_LOCAL][VAL_STRIDE] __attribute__((aligned(64)));
 } Worker;
 
 void vm_reset_program(void);

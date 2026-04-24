@@ -315,8 +315,7 @@ static Interval forward(Worker *w, const Tape *t, Box b) {
   }
   return w->fwd[t->root];
 }
-static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
-  Interval r = forward(w, t, b);
+static bool contract_after_forward(Worker *w, const Tape *t, Box b, Interval r, Box *out) {
   if (!ok_i(r) || r.lo >= 0) return false;
   if (++w->tag == 0) {
     memset(w->want_tag, 0, sizeof(w->want_tag));
@@ -371,6 +370,9 @@ static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
   if (!ok_i(x) || !ok_i(y)) return false;
   *out = (Box){x.lo, x.hi, y.lo, y.hi};
   return true;
+}
+static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
+  return contract_after_forward(w, t, b, forward(w, t, b), out);
 }
 static bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
   for (int i = 0; i < rounds; i++) {
@@ -430,6 +432,9 @@ static int refine_boxes(Worker *w, const Tape *t, Box *out) {
 static inline PixelBox pbox(Box b) {
   return (PixelBox){clampi((int)ceilf((b.x0 + 1) * .5f * (IMAGE_W - 1)), 0, IMAGE_W), clampi((int)floorf((b.x1 + 1) * .5f * (IMAGE_W - 1)), -1, IMAGE_W - 1),
                     clampi((int)ceilf((b.y0 + 1) * .5f * (IMAGE_H - 1)), 0, IMAGE_H), clampi((int)floorf((b.y1 + 1) * .5f * (IMAGE_H - 1)), -1, IMAGE_H - 1)};
+}
+static inline PixelBox intersect_pbox(PixelBox a, PixelBox b) {
+  return (PixelBox){a.x0 > b.x0 ? a.x0 : b.x0, a.x1 < b.x1 ? a.x1 : b.x1, a.y0 > b.y0 ? a.y0 : b.y0, a.y1 < b.y1 ? a.y1 : b.y1};
 }
 static inline void fill_box(PixelBox p) {
   int n = p.x1 - p.x0 + 1;
@@ -532,15 +537,50 @@ static void eval_box(Worker *w, const Tape *t, Box b) {
     push_split(p, st, &sp);
   }
 }
+static void eval_box_cold(Worker *w, const Tape *t, PixelBox root) {
+  PixelBox st[256];
+  int sp = 0;
+  st[sp++] = root;
+  while (sp) {
+    PixelBox p = st[--sp];
+    int pw = p.x1 - p.x0 + 1, ph = p.y1 - p.y0 + 1, pixels = pw * ph;
+    if (pixels <= 0) continue;
+    Box dom = pdom(p);
+    Interval r = forward(w, t, dom);
+    if (!ok_i(r) || r.lo >= 0) continue;
+    if (r.hi < 0) {
+      fill_box(p);
+      continue;
+    }
+    if (pixels <= 1024) {
+      eval_box_raw(w, t, p);
+      continue;
+    }
+    if (pixels >= 32768 && t->n >= 8) {
+      Box contracted;
+      if (contract_after_forward(w, t, dom, r, &contracted)) {
+        PixelBox q = intersect_pbox(p, pbox(contracted));
+        int qw = q.x1 - q.x0 + 1, qh = q.y1 - q.y0 + 1, qp = qw * qh;
+        if (qp > 0 && qp < pixels / 8) {
+          st[sp++] = q;
+          continue;
+        }
+      }
+    }
+    if (sp + 2 >= 256) {
+      eval_box_raw(w, t, p);
+      continue;
+    }
+    push_split(p, st, &sp);
+  }
+}
 
 static void render_terms(Worker *w) {
-  Box boxes[MAX_BOXES_PER_TERM];
 #pragma omp for schedule(dynamic, 1) nowait
   for (int i = 0; i < nfrontier; i++) {
     Tape t;
     if (!build_tape(w, i, &t)) continue;
-    int nb = refine_boxes(w, &t, boxes);
-    for (int k = 0; k < nb; k++) eval_box(w, &t, boxes[k]);
+    eval_box_cold(w, &t, (PixelBox){0, IMAGE_W - 1, 0, IMAGE_H - 1});
   }
 }
 void vm_render_frame(Worker *w) {
