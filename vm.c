@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -9,6 +10,9 @@ enum {
   BASE_REFINE_ROUNDS = 6,
   CHILD_REFINE_ROUNDS = 3
 };
+#ifndef TILE_H
+#define TILE_H 16
+#endif
 #define NEG_INF (-1e30f)
 #define VEC(dst, n, expr)                                                                                                                                      \
   do { _Pragma("omp simd") for (int ix = 0; ix < (n); ix++)(dst)[ix] = (expr); } while (0)
@@ -27,11 +31,20 @@ typedef struct {
   uint8_t fill, nx, ny, nf, mode[MAX_LOCAL], arg[MAX_LOCAL], xop[MAX_LOCAL], yop[MAX_LOCAL], fop[MAX_LOCAL];
   Instr ins[MAX_LOCAL];
 } Tape;
+typedef struct {
+  Tape tape;
+  PixelBox boxes[MAX_BOXES_PER_TERM];
+  uint8_t nboxes, aff[MAX_LOCAL];
+  float ax[MAX_LOCAL], ay[MAX_LOCAL], ac[MAX_LOCAL], scalar[MAX_LOCAL];
+} TermPlan;
 
 static Instr ins[MAX_INS];
-static int nins, xidx = -1, yidx = -1, frontier[MAX_INS], nfrontier;
+static int nins, xidx = -1, yidx = -1, frontier[MAX_INS], nfrontier, nplans;
+static int plan_cap;
 static uint16_t frontier_mark[MAX_INS], frontier_gen = 1;
 static uint8_t image[IMAGE_W * IMAGE_H];
+static bool plans_ready;
+static TermPlan *plans;
 static float gx[IMAGE_W], gy[IMAGE_H];
 
 static inline Interval I(float lo, float hi) { return (Interval){lo, hi}; }
@@ -82,13 +95,15 @@ static inline float eval_scalar(Op op, float a, float b) {
 }
 
 void vm_reset_program(void) {
-  nins = nfrontier = 0;
+  nins = nfrontier = nplans = 0;
   xidx = yidx = -1;
+  plans_ready = false;
   frontier_gen = 1;
   memset(frontier_mark, 0, sizeof(frontier_mark));
 }
 int vm_add_instr(Instr in) {
   if (nins >= MAX_INS) return -1;
+  plans_ready = false;
   if (in.op == OP_VARX) xidx = nins;
   if (in.op == OP_VARY) yidx = nins;
   ins[nins] = in;
@@ -427,6 +442,49 @@ static int refine_boxes(Worker *w, const Tape *t, Box *out) {
   return nl;
 }
 
+static void reserve_plans(int cap) {
+  if (cap <= plan_cap) return;
+  TermPlan *p = realloc(plans, (size_t)cap * sizeof(*plans));
+  if (!p) abort();
+  plans = p;
+  plan_cap = cap;
+}
+static inline PixelBox pbox(Box b);
+static void save_plan(TermPlan *p, const Worker *w, const Tape *t) {
+  int n = t->n;
+  p->tape = *t;
+  memcpy(p->aff, w->aff, n * sizeof(p->aff[0]));
+  memcpy(p->ax, w->ax, n * sizeof(p->ax[0]));
+  memcpy(p->ay, w->ay, n * sizeof(p->ay[0]));
+  memcpy(p->ac, w->ac, n * sizeof(p->ac[0]));
+  memcpy(p->scalar, w->scalar, n * sizeof(p->scalar[0]));
+}
+static void load_plan(Worker *w, const TermPlan *p) {
+  int n = p->tape.n;
+  memcpy(w->aff, p->aff, n * sizeof(w->aff[0]));
+  memcpy(w->ax, p->ax, n * sizeof(w->ax[0]));
+  memcpy(w->ay, p->ay, n * sizeof(w->ay[0]));
+  memcpy(w->ac, p->ac, n * sizeof(w->ac[0]));
+  memcpy(w->scalar, p->scalar, n * sizeof(w->scalar[0]));
+}
+static void build_plans(Worker *w) {
+  Box boxes[MAX_BOXES_PER_TERM];
+  extract_frontier();
+  reserve_plans(nfrontier);
+  nplans = 0;
+  for (int i = 0; i < nfrontier; i++) {
+    Tape t;
+    if (!build_tape(w, i, &t)) continue;
+    TermPlan *p = &plans[nplans];
+    save_plan(p, w, &t);
+    p->nboxes = refine_boxes(w, &p->tape, boxes);
+    if (!p->nboxes) continue;
+    for (int k = 0; k < p->nboxes; k++) p->boxes[k] = pbox(boxes[k]);
+    nplans++;
+  }
+  plans_ready = true;
+}
+
 static inline PixelBox pbox(Box b) {
   return (PixelBox){clampi((int)ceilf((b.x0 + 1) * .5f * (IMAGE_W - 1)), 0, IMAGE_W), clampi((int)floorf((b.x1 + 1) * .5f * (IMAGE_W - 1)), -1, IMAGE_W - 1),
                     clampi((int)ceilf((b.y0 + 1) * .5f * (IMAGE_H - 1)), 0, IMAGE_H), clampi((int)floorf((b.y1 + 1) * .5f * (IMAGE_H - 1)), -1, IMAGE_H - 1)};
@@ -503,8 +561,8 @@ static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
     }
   }
 }
-static void eval_box(Worker *w, const Tape *t, Box b) {
-  PixelBox st[128], p = pbox(b);
+static void eval_pbox(Worker *w, const Tape *t, PixelBox p) {
+  PixelBox st[128];
   int sp = 0;
   if (p.x1 < p.x0 || p.y1 < p.y0) return;
   if (t->fill) {
@@ -533,22 +591,39 @@ static void eval_box(Worker *w, const Tape *t, Box b) {
   }
 }
 
-static void render_terms(Worker *w) {
-  Box boxes[MAX_BOXES_PER_TERM];
+static inline PixelBox clip_tile(PixelBox p, int y0, int y1) {
+  p.y0 = p.y0 < y0 ? y0 : p.y0;
+  p.y1 = p.y1 >= y1 ? y1 - 1 : p.y1;
+  return p;
+}
+static void render_tiles(Worker *w) {
+  int ntiles = (IMAGE_H + TILE_H - 1) / TILE_H;
 #pragma omp for schedule(dynamic, 1) nowait
-  for (int i = 0; i < nfrontier; i++) {
-    Tape t;
-    if (!build_tape(w, i, &t)) continue;
-    int nb = refine_boxes(w, &t, boxes);
-    for (int k = 0; k < nb; k++) eval_box(w, &t, boxes[k]);
+  for (int tile = 0; tile < ntiles; tile++) {
+    int y0 = tile * TILE_H;
+    int y1 = y0 + TILE_H < IMAGE_H ? y0 + TILE_H : IMAGE_H;
+    for (int i = 0; i < nplans; i++) {
+      const TermPlan *p = &plans[i];
+      bool loaded = false;
+      for (int k = 0; k < p->nboxes; k++) {
+        PixelBox b = p->boxes[k];
+        if (b.y1 < y0 || b.y0 >= y1) continue;
+        if (!loaded) {
+          load_plan(w, p);
+          loaded = true;
+        }
+        eval_pbox(w, &p->tape, clip_tile(b, y0, y1));
+      }
+    }
   }
 }
 void vm_render_frame(Worker *w) {
-#pragma omp single nowait
-  extract_frontier();
-#pragma omp for schedule(static) nowait
+#pragma omp single
+  {
+    if (!plans_ready) build_plans(w);
+  }
+#pragma omp for schedule(static)
   for (int y = 0; y < IMAGE_H; y++) memset(&image[y * IMAGE_W], 0, IMAGE_W);
-#pragma omp barrier
-  render_terms(w);
+  render_tiles(w);
 #pragma omp barrier
 }
