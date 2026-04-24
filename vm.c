@@ -1,538 +1,554 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
+#include "vm.h"
+
 #include <math.h>
-#include <time.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include <stdbool.h>
+#include <string.h>
 
-#define MAX_INS 10000
-#define MAX_FRONTIER 2000
-#define MAX_LOCAL 128
-#define MAX_BOXES_PER_TERM 16
-#define IMAGE_W 1024
-#define IMAGE_H 1024
+enum {
+  MAX_BOXES_PER_TERM = 16,
+  BASE_REFINE_ROUNDS = 6,
+  CHILD_REFINE_ROUNDS = 3
+};
 #define NEG_INF (-1e30f)
-#define OMP_SCHEDULE_KIND guided,1
-#define BENCH_RUNS 8
-#define BASE_REFINE_ROUNDS 4
-#define CHILD_REFINE_ROUNDS 2
-#define MAX_SPLIT_DEPTH 4
-#define AREA_THRESHOLD 0.0095f
-#define UNION_AREA_SHRINK 0.95f
+#define VEC(dst, n, expr)                                                                                                                                      \
+  do { _Pragma("omp simd") for (int ix = 0; ix < (n); ix++)(dst)[ix] = (expr); } while (0)
+#define ARG(is_scalar, value, ptr, i) ((is_scalar) ? (value) : (ptr)[i])
 
-typedef enum {OP_CONST, OP_VARX, OP_VARY, OP_ADD, OP_SUB, OP_MUL, OP_NEG, OP_SQUARE, OP_SQRT, OP_MIN, OP_MAX} Op;
-typedef enum {MODE_SCALAR, MODE_X, MODE_Y, MODE_FULL} ValueMode;
-typedef struct { Op op; int16_t a, b; float fa, fb; } Instr;
-typedef struct { float lo, hi; } Interval;
-typedef struct { float x0,x1,y0,y1; } Box;
-typedef struct { char key[32]; int idx; } IdMap;
+typedef enum { MODE_SCALAR, MODE_X, MODE_Y, MODE_FULL } Mode;
 typedef struct {
-    uint16_t n;
-    uint16_t root;
-    int16_t xlocal, ylocal;
-    uint8_t nxops, nyops;
-    Instr ins[MAX_LOCAL];
-    uint8_t mode[MAX_LOCAL];
-    uint8_t xops[MAX_LOCAL];
-    uint8_t yops[MAX_LOCAL];
-} CompactTape;
-
+  float x0, x1, y0, y1;
+} Box;
 typedef struct {
-    Interval fwd[MAX_LOCAL], desired[MAX_LOCAL];
-    uint16_t desired_tag[MAX_LOCAL], mark_tag[MAX_INS], local_map[MAX_INS];
-    uint16_t cur_tag, cur_mark;
-    int post[MAX_LOCAL];
-    int sp; int stack[MAX_LOCAL*2];
-    float vals[MAX_LOCAL][IMAGE_W] __attribute__((aligned(64)));
-} Worker;
+  int x0, x1, y0, y1;
+} PixelBox;
+typedef struct {
+  uint16_t n, root;
+  int16_t xl, yl;
+  uint8_t fill, nx, ny, nf, mode[MAX_LOCAL], arg[MAX_LOCAL], xop[MAX_LOCAL], yop[MAX_LOCAL], fop[MAX_LOCAL];
+  Instr ins[MAX_LOCAL];
+} Tape;
 
-static Instr gins[MAX_INS];
-static int nins=0, root=-1, xidx=-1, yidx=-1;
-static int frontier[MAX_FRONTIER], nfrontier=0;
-static uint16_t frontier_mark[MAX_INS];
-static uint16_t frontier_mark_gen = 1;
-static IdMap ids[MAX_INS]; static int nids=0;
-static int nwork_boxes = 0;
+static Instr ins[MAX_INS];
+static int nins, xidx = -1, yidx = -1, frontier[MAX_INS], nfrontier;
+static uint16_t frontier_mark[MAX_INS], frontier_gen = 1;
 static uint8_t image[IMAGE_W * IMAGE_H];
-static float gxcoords[IMAGE_W], gycoords[IMAGE_H];
-static inline int clampi(int v, int lo, int hi);
-static inline float box_area(Box b);
+static float gx[IMAGE_W], gy[IMAGE_H];
 
-static inline double now_sec(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec*1e-9; }
-static inline Interval I(float lo,float hi){ Interval r={lo,hi}; return r; }
-static inline float fmin4(float a,float b,float c,float d){ return fminf(fminf(a,b),fminf(c,d)); }
-static inline float fmax4(float a,float b,float c,float d){ return fmaxf(fmaxf(a,b),fmaxf(c,d)); }
-static inline Interval intersect_i(Interval a, Interval b){ return I(fmaxf(a.lo,b.lo), fminf(a.hi,b.hi)); }
-static inline bool valid_i(Interval a){ return a.lo <= a.hi; }
-static inline Interval iadd(Interval x, Interval y){ return I(x.lo+y.lo,x.hi+y.hi); }
-static inline Interval isub(Interval x, Interval y){ return I(x.lo-y.hi,x.hi-y.lo); }
-static inline Interval ineg(Interval x){ return I(-x.hi,-x.lo); }
-static inline Interval imul(Interval x, Interval y){ float a=x.lo*y.lo,b=x.lo*y.hi,c=x.hi*y.lo,d=x.hi*y.hi; return I(fmin4(a,b,c,d),fmax4(a,b,c,d)); }
-static inline Interval isquare(Interval x){ float l=x.lo,u=x.hi; if(l<=0&&0<=u) return I(0.0f,fmaxf(l*l,u*u)); float a=l*l,b=u*u; return I(fminf(a,b),fmaxf(a,b)); }
-static inline Interval isqrt_i(Interval x){ if(x.hi<0) return I(1.0f,0.0f); return I(sqrtf(fmaxf(0.0f,x.lo)), sqrtf(fmaxf(0.0f,x.hi))); }
-static inline Interval imin_i(Interval x, Interval y){ return I(fminf(x.lo,y.lo), fminf(x.hi,y.hi)); }
-static inline Interval imax_i(Interval x, Interval y){ return I(fmaxf(x.lo,y.lo), fmaxf(x.hi,y.hi)); }
-static inline Interval div_i(Interval z, Interval d){ float a=z.lo/d.lo,b=z.lo/d.hi,c=z.hi/d.lo,e=z.hi/d.hi; return I(fmin4(a,b,c,e), fmax4(a,b,c,e)); }
-static inline float box_area(Box b){ return fmaxf(0,b.x1-b.x0)*fmaxf(0,b.y1-b.y0); }
-static inline uint8_t combine_mode(uint8_t a, uint8_t b){
-    if(a == MODE_FULL || b == MODE_FULL) return MODE_FULL;
-    if(a == MODE_SCALAR) return b;
-    if(b == MODE_SCALAR) return a;
-    return a == b ? a : MODE_FULL;
+static inline Interval I(float lo, float hi) { return (Interval){lo, hi}; }
+static inline bool ok_i(Interval a) { return a.lo <= a.hi; }
+static inline Interval inter(Interval a, Interval b) { return I(fmaxf(a.lo, b.lo), fminf(a.hi, b.hi)); }
+static inline float min4(float a, float b, float c, float d) { return fminf(fminf(a, b), fminf(c, d)); }
+static inline float max4(float a, float b, float c, float d) { return fmaxf(fmaxf(a, b), fmaxf(c, d)); }
+static inline Interval iadd(Interval a, Interval b) { return I(a.lo + b.lo, a.hi + b.hi); }
+static inline Interval isub(Interval a, Interval b) { return I(a.lo - b.hi, a.hi - b.lo); }
+static inline Interval imul(Interval a, Interval b) {
+  float p = a.lo * b.lo, q = a.lo * b.hi, r = a.hi * b.lo, s = a.hi * b.hi;
+  return I(min4(p, q, r, s), max4(p, q, r, s));
+}
+static inline Interval ineg(Interval a) { return I(-a.hi, -a.lo); }
+static inline Interval isqr(Interval a) {
+  if (a.lo <= 0 && a.hi >= 0) return I(0, fmaxf(a.lo * a.lo, a.hi * a.hi));
+  return I(fminf(a.lo * a.lo, a.hi * a.hi), fmaxf(a.lo * a.lo, a.hi * a.hi));
+}
+static inline Interval isqrt_i(Interval a) { return a.hi < 0 ? I(1, 0) : I(sqrtf(fmaxf(0, a.lo)), sqrtf(fmaxf(0, a.hi))); }
+static inline Interval idiv(Interval z, Interval d) {
+  return I(min4(z.lo / d.lo, z.lo / d.hi, z.hi / d.lo, z.hi / d.hi), max4(z.lo / d.lo, z.lo / d.hi, z.hi / d.lo, z.hi / d.hi));
+}
+static inline Interval idiv1(Interval z, float d) { return I(fminf(z.lo / d, z.hi / d), fmaxf(z.lo / d, z.hi / d)); }
+static inline Interval iaff(float ax, float ay, float c, Box b) {
+  float x0 = ax * b.x0, x1 = ax * b.x1, y0 = ay * b.y0, y1 = ay * b.y1;
+  return I(fminf(x0, x1) + fminf(y0, y1) + c, fmaxf(x0, x1) + fmaxf(y0, y1) + c);
+}
+static inline float area(Box b) { return fmaxf(0, b.x1 - b.x0) * fmaxf(0, b.y1 - b.y0); }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline uint8_t mode2(uint8_t a, uint8_t b) {
+  if (a == MODE_FULL || b == MODE_FULL) return MODE_FULL;
+  if (a == MODE_SCALAR) return b;
+  if (b == MODE_SCALAR) return a;
+  return a == b ? a : MODE_FULL;
+}
+static inline float eval_scalar(Op op, float a, float b) {
+  switch (op) {
+  case OP_ADD: return a + b;
+  case OP_SUB: return a - b;
+  case OP_MUL: return a * b;
+  case OP_MIN: return fminf(a, b);
+  case OP_MAX: return fmaxf(a, b);
+  case OP_NEG: return -a;
+  case OP_SQUARE: return a * a;
+  case OP_SQRT: return sqrtf(a);
+  default: return a;
+  }
 }
 
-static int parse_op(const char* s){
-    if(!strcmp(s,"const")) return OP_CONST; if(!strcmp(s,"var-x")) return OP_VARX; if(!strcmp(s,"var-y")) return OP_VARY;
-    if(!strcmp(s,"add")) return OP_ADD; if(!strcmp(s,"sub")) return OP_SUB; if(!strcmp(s,"mul")) return OP_MUL; if(!strcmp(s,"neg")) return OP_NEG;
-    if(!strcmp(s,"square")) return OP_SQUARE; if(!strcmp(s,"sqrt")) return OP_SQRT; if(!strcmp(s,"min")) return OP_MIN; if(!strcmp(s,"max")) return OP_MAX;
-    fprintf(stderr,"unknown op %s\n", s); exit(1);
+void vm_reset_program(void) {
+  nins = nfrontier = 0;
+  xidx = yidx = -1;
+  frontier_gen = 1;
+  memset(frontier_mark, 0, sizeof(frontier_mark));
 }
-static int lookup_id(const char* s){ for(int i=0;i<nids;i++) if(!strcmp(ids[i].key,s)) return ids[i].idx; return -1; }
-static void add_id(const char* s,int idx){ strcpy(ids[nids].key,s); ids[nids].idx=idx; nids++; }
-
-static void init_coords(void){
-    for(int i=0;i<IMAGE_W;i++) gxcoords[i] = -1.0f + 2.0f * (float)i / (float)(IMAGE_W - 1);
-    for(int i=0;i<IMAGE_H;i++) gycoords[i] = -1.0f + 2.0f * (float)i / (float)(IMAGE_H - 1);
+int vm_add_instr(Instr in) {
+  if (nins >= MAX_INS) return -1;
+  if (in.op == OP_VARX) xidx = nins;
+  if (in.op == OP_VARY) yidx = nins;
+  ins[nins] = in;
+  return nins++;
 }
-
-static void load_vm(const char* path){
-    FILE* f=fopen(path,"r"); if(!f){ perror("fopen"); exit(1);} char line[256];
-    while(fgets(line,sizeof(line),f)){
-        if(line[0]=='#'||line[0]=='\n'||line[0]=='\0') continue;
-        char id[32], op[32], a[64]="", b[64]="";
-        int n=sscanf(line,"%31s %31s %63s %63s", id, op, a, b); if(n<2) continue;
-        add_id(id,nins); Instr *in=&gins[nins]; in->op=parse_op(op); in->a=in->b=-1; in->fa=in->fb=0;
-        if(in->op==OP_VARX) xidx=nins; if(in->op==OP_VARY) yidx=nins;
-        if(n>=3){ if(a[0]=='_') in->a=lookup_id(a); else in->fa=strtof(a,NULL); }
-        if(n>=4){ if(b[0]=='_') in->b=lookup_id(b); else in->fb=strtof(b,NULL); }
-        nins++;
-    }
-    fclose(f); root=nins-1;
+int vm_instruction_count(void) { return nins; }
+int vm_frontier_count(void) { return nfrontier; }
+int vm_checksum(void) {
+  int sum = 0;
+  for (int i = 0; i < IMAGE_W * IMAGE_H; i++) sum += image[i];
+  return sum;
 }
-
-static void extract_frontier(void){
-    nfrontier=0;
-    if(++frontier_mark_gen == 0){
-        memset(frontier_mark, 0, sizeof(frontier_mark));
-        frontier_mark_gen = 1;
-    }
-    int st[MAX_INS], sp=0;
-    st[sp++]=root;
-    while(sp){
-        int v=st[--sp];
-        if(frontier_mark[v] == frontier_mark_gen) continue;
-        frontier_mark[v] = frontier_mark_gen;
-        Instr in=gins[v];
-        if(in.op==OP_MIN){
-            if(in.a>=0) st[sp++]=in.a;
-            if(in.b>=0) st[sp++]=in.b;
-        } else frontier[nfrontier++]=v;
-    }
+void vm_worker_init(Worker *w) {
+  memset(w, 0, sizeof(*w));
+  w->tag = w->mark_id = 1;
+}
+void vm_init_coords(void) {
+  for (int i = 0; i < IMAGE_W; i++) gx[i] = -1 + 2 * (float)i / (IMAGE_W - 1);
+  for (int i = 0; i < IMAGE_H; i++) gy[i] = -1 + 2 * (float)i / (IMAGE_H - 1);
+}
+static void extract_frontier(void) {
+  nfrontier = 0;
+  if (++frontier_gen == 0) {
+    memset(frontier_mark, 0, sizeof(frontier_mark));
+    frontier_gen = 1;
+  }
+  int st[MAX_INS], sp = 0;
+  st[sp++] = nins - 1;
+  while (sp) {
+    int v = st[--sp];
+    if (frontier_mark[v] == frontier_gen) continue;
+    frontier_mark[v] = frontier_gen;
+    if (ins[v].op == OP_MIN) {
+      if (ins[v].a >= 0) st[sp++] = ins[v].a;
+      if (ins[v].b >= 0) st[sp++] = ins[v].b;
+    } else frontier[nfrontier++] = v;
+  }
 }
 
-static inline void build_worker_init(Worker* w){
-    memset(w->desired_tag,0,sizeof(w->desired_tag));
-    memset(w->mark_tag,0,sizeof(w->mark_tag));
-    w->cur_tag=1;
-    w->cur_mark=1;
+static inline void set_aff(Worker *w, int i, float ax, float ay, float ac) {
+  w->aff[i] = 1;
+  w->ax[i] = ax;
+  w->ay[i] = ay;
+  w->ac[i] = ac;
 }
-
-static inline bool build_compact_tape_term(Worker* w, int fi, CompactTape* tp){
-    int fr = frontier[fi];
-    if(++w->cur_mark == 0){ memset(w->mark_tag,0,sizeof(w->mark_tag)); w->cur_mark = 1; }
-    int postn=0, sp=0;
-    w->stack[sp++] = fr;
-    w->stack[sp++] = 0;
-    while(sp){
-        int state = w->stack[--sp];
-        int v = w->stack[--sp];
-        if(state==0){
-            if(w->mark_tag[v] == w->cur_mark) continue;
-            w->mark_tag[v] = w->cur_mark;
-            w->stack[sp++] = v; w->stack[sp++] = 1;
-            Instr in = gins[v];
-            if(in.b >= 0){ w->stack[sp++] = in.b; w->stack[sp++] = 0; }
-            if(in.a >= 0){ w->stack[sp++] = in.a; w->stack[sp++] = 0; }
-        } else {
-            if(postn >= MAX_LOCAL) return false;
-            w->post[postn++] = v;
-        }
-    }
-    tp->n = (uint16_t)postn;
-    tp->xlocal = tp->ylocal = -1;
-    tp->nxops = tp->nyops = 0;
-    for(int i=0;i<postn;i++) w->local_map[w->post[i]] = i;
-    for(int i=0;i<postn;i++){
-        int gv = w->post[i];
-        Instr in = gins[gv];
-        if(in.a >= 0) in.a = w->local_map[in.a];
-        if(in.b >= 0) in.b = w->local_map[in.b];
-        tp->ins[i] = in;
-        switch(in.op){
-            case OP_CONST: tp->mode[i] = MODE_SCALAR; break;
-            case OP_VARX: tp->mode[i] = MODE_X; break;
-            case OP_VARY: tp->mode[i] = MODE_Y; break;
-            case OP_NEG:
-            case OP_SQUARE:
-            case OP_SQRT:
-                tp->mode[i] = in.a >= 0 ? tp->mode[in.a] : MODE_SCALAR;
-                break;
-            case OP_ADD:
-            case OP_SUB:
-            case OP_MUL:
-            case OP_MIN:
-            case OP_MAX: {
-                uint8_t ma = in.a >= 0 ? tp->mode[in.a] : MODE_SCALAR;
-                uint8_t mb = in.b >= 0 ? tp->mode[in.b] : MODE_SCALAR;
-                tp->mode[i] = combine_mode(ma, mb);
-            } break;
-        }
-        if(gv == xidx) tp->xlocal = i;
-        if(gv == yidx) tp->ylocal = i;
-        if(gv == fr) tp->root = i;
-        if(tp->mode[i] != MODE_Y && tp->mode[i] != MODE_FULL) tp->xops[tp->nxops++] = (uint8_t)i;
-        if(tp->mode[i] != MODE_SCALAR && tp->mode[i] != MODE_X) tp->yops[tp->nyops++] = (uint8_t)i;
-    }
-    return true;
+static void analyze_affine(Worker *w, const Tape *t, int i) {
+  Instr in = t->ins[i];
+  w->aff[i] = 0;
+  if (in.op == OP_CONST) set_aff(w, i, 0, 0, in.fa);
+  else if (in.op == OP_VARX) set_aff(w, i, 1, 0, 0);
+  else if (in.op == OP_VARY) set_aff(w, i, 0, 1, 0);
+  else if (in.op == OP_NEG && w->aff[in.a]) set_aff(w, i, -w->ax[in.a], -w->ay[in.a], -w->ac[in.a]);
+  else if ((in.op == OP_ADD || in.op == OP_SUB) && w->aff[in.a] && w->aff[in.b]) {
+    float s = in.op == OP_ADD ? 1 : -1;
+    set_aff(w, i, w->ax[in.a] + s * w->ax[in.b], w->ay[in.a] + s * w->ay[in.b], w->ac[in.a] + s * w->ac[in.b]);
+  } else if (in.op == OP_MUL && t->mode[in.a] == MODE_SCALAR && w->aff[in.b]) {
+    float s = w->scalar[in.a];
+    set_aff(w, i, s * w->ax[in.b], s * w->ay[in.b], s * w->ac[in.b]);
+  } else if (in.op == OP_MUL && t->mode[in.b] == MODE_SCALAR && w->aff[in.a]) {
+    float s = w->scalar[in.b];
+    set_aff(w, i, s * w->ax[in.a], s * w->ay[in.a], s * w->ac[in.a]);
+  }
 }
-
-static inline void upd_desired(Worker* w, int child, Interval iv, Interval child_fwd){
-    if(child<0) return;
-    iv = intersect_i(iv, child_fwd);
-    if(!valid_i(iv)) return;
-    if(w->desired_tag[child] != w->cur_tag){ w->desired[child]=iv; w->desired_tag[child]=w->cur_tag; }
-    else w->desired[child] = intersect_i(w->desired[child], iv);
-}
-
-static inline bool contract_once(Worker* w, const CompactTape* tp, Box domain, Box* out){
-    int n=tp->n;
-    for(int v=0; v<n; v++){
-        Instr in=tp->ins[v];
-        switch(in.op){
-            case OP_CONST: w->fwd[v]=I(in.fa,in.fa); break;
-            case OP_VARX: w->fwd[v]=I(domain.x0,domain.x1); break;
-            case OP_VARY: w->fwd[v]=I(domain.y0,domain.y1); break;
-            case OP_ADD: w->fwd[v]=iadd(w->fwd[in.a],w->fwd[in.b]); break;
-            case OP_SUB: w->fwd[v]=isub(w->fwd[in.a],w->fwd[in.b]); break;
-            case OP_MUL: w->fwd[v]=imul(w->fwd[in.a],w->fwd[in.b]); break;
-            case OP_NEG: w->fwd[v]=ineg(w->fwd[in.a]); break;
-            case OP_SQUARE: w->fwd[v]=isquare(w->fwd[in.a]); break;
-            case OP_SQRT: w->fwd[v]=isqrt_i(w->fwd[in.a]); break;
-            case OP_MIN: w->fwd[v]=imin_i(w->fwd[in.a],w->fwd[in.b]); break;
-            case OP_MAX: w->fwd[v]=imax_i(w->fwd[in.a],w->fwd[in.b]); break;
-        }
+static inline void detect_rewrites(Worker *w, Tape *t, const uint8_t *nonneg) {
+  uint8_t sign[MAX_LOCAL] = {0};
+  sign[t->root] = 1;
+  for (int i = t->n - 1; i >= 0; i--)
+    if (sign[i]) {
+      Instr in = t->ins[i];
+      if (in.op == OP_MIN || in.op == OP_MAX) {
+        if (in.a >= 0) sign[in.a] = 1;
+        if (in.b >= 0) sign[in.b] = 1;
+      } else if (in.op == OP_NEG && in.a >= 0) sign[in.a] = 1;
     }
-    int r = tp->root;
-    if(!valid_i(w->fwd[r]) || w->fwd[r].lo >= 0.0f) return false;
-    if(++w->cur_tag == 0){ memset(w->desired_tag,0,sizeof(w->desired_tag)); w->cur_tag=1; }
-    w->desired[r]=I(NEG_INF,0.0f); w->desired_tag[r]=w->cur_tag;
-    for(int v=n-1; v>=0; v--){
-        if(w->desired_tag[v] != w->cur_tag) continue;
-        Interval z = w->desired[v]; Instr in=tp->ins[v];
-        Interval xa = (in.a>=0? w->fwd[in.a] : I(in.fa,in.fa));
-        Interval xb = (in.b>=0? w->fwd[in.b] : I(in.fb,in.fb));
-        switch(in.op){
-            case OP_CONST: case OP_VARX: case OP_VARY: break;
-            case OP_ADD: upd_desired(w,in.a,I(z.lo-xb.hi,z.hi-xb.lo),xa); upd_desired(w,in.b,I(z.lo-xa.hi,z.hi-xa.lo),xb); break;
-            case OP_SUB: upd_desired(w,in.a,I(z.lo+xb.lo,z.hi+xb.hi),xa); upd_desired(w,in.b,I(xa.lo-z.hi,xa.hi-z.lo),xb); break;
-            case OP_MUL: if(xb.lo>0.0f||xb.hi<0.0f) upd_desired(w,in.a,div_i(z,xb),xa); if(xa.lo>0.0f||xa.hi<0.0f) upd_desired(w,in.b,div_i(z,xa),xb); break;
-            case OP_NEG: upd_desired(w,in.a,I(-z.hi,-z.lo),xa); break;
-            case OP_SQUARE: { float s=sqrtf(fmaxf(0.0f,z.hi)); upd_desired(w,in.a,I(-s,s),xa);} break;
-            case OP_SQRT: if(z.hi>=0.0f){ float zl=fmaxf(0.0f,z.lo), zh=fmaxf(0.0f,z.hi); upd_desired(w,in.a,I(zl*zl,zh*zh),xa);} break;
-            case OP_MAX: upd_desired(w,in.a,I(NEG_INF,z.hi),xa); upd_desired(w,in.b,I(NEG_INF,z.hi),xb); break;
-            case OP_MIN:
-                upd_desired(w,in.a,I(z.lo,xa.hi),xa);
-                upd_desired(w,in.b,I(z.lo,xb.hi),xb);
-                if(xa.lo > z.hi) upd_desired(w,in.b,I(NEG_INF,z.hi),xb);
-                if(xb.lo > z.hi) upd_desired(w,in.a,I(NEG_INF,z.hi),xa);
-                break;
-        }
-    }
-    int xl=tp->xlocal, yl=tp->ylocal;
-    Interval xr = (xl>=0 && w->desired_tag[xl]==w->cur_tag ? intersect_i(w->desired[xl], I(domain.x0,domain.x1)) : I(domain.x0,domain.x1));
-    Interval yr = (yl>=0 && w->desired_tag[yl]==w->cur_tag ? intersect_i(w->desired[yl], I(domain.y0,domain.y1)) : I(domain.y0,domain.y1));
-    if(!valid_i(xr) || !valid_i(yr)) return false;
-    *out=(Box){xr.lo,xr.hi,yr.lo,yr.hi}; return true;
-}
-
-static inline bool refine_iters(Worker* w, const CompactTape* tp, Box in, int rounds, Box* out){
-    Box cur=in;
-    for(int i=0;i<rounds;i++){
-        Box prev = cur;
-        Box nxt; if(!contract_once(w,tp,cur,&nxt)) return false;
-        cur.x0=fmaxf(cur.x0,nxt.x0); cur.x1=fminf(cur.x1,nxt.x1); cur.y0=fmaxf(cur.y0,nxt.y0); cur.y1=fminf(cur.y1,nxt.y1);
-        if(cur.x0>cur.x1 || cur.y0>cur.y1) return false;
-        if(cur.x0 == prev.x0 && cur.x1 == prev.x1 && cur.y0 == prev.y0 && cur.y1 == prev.y1) break;
-    }
-    *out=cur; return true;
-}
-
-static inline void split_box(Box b, Box out[2]){ float dx=b.x1-b.x0, dy=b.y1-b.y0; if(dx>=dy){ float xm=0.5f*(b.x0+b.x1); out[0]=(Box){b.x0,xm,b.y0,b.y1}; out[1]=(Box){xm,b.x1,b.y0,b.y1}; } else { float ym=0.5f*(b.y0+b.y1); out[0]=(Box){b.x0,b.x1,b.y0,ym}; out[1]=(Box){b.x0,b.x1,ym,b.y1}; } }
-
-static inline int multi_box_refine(Worker* w, const CompactTape* tp, Box* out_boxes){
-    Box base; if(!refine_iters(w,tp,(Box){-1,1,-1,1},BASE_REFINE_ROUNDS,&base) || box_area(base)<=0.0f) return 0;
-    Box leaves[MAX_BOXES_PER_TERM]; int nleaves=1; leaves[0]=base;
-    for(int depth=0; depth<MAX_SPLIT_DEPTH; depth++){
-        Box next[MAX_BOXES_PER_TERM]; int nnext=0; bool changed=false;
-        for(int i=0;i<nleaves;i++){
-            Box b=leaves[i]; float ba=box_area(b);
-            if(ba<=AREA_THRESHOLD || nnext + 2 > MAX_BOXES_PER_TERM){ next[nnext++]=b; continue; }
-            Box kids[2]; split_box(b,kids); Box kept[2]; int nkept=0; float union_area=0.0f;
-            for(int k=0;k<2;k++){ Box rb; if(refine_iters(w,tp,kids[k],CHILD_REFINE_ROUNDS,&rb)){ float ra=box_area(rb); if(ra>0.0f){ kept[nkept++]=rb; union_area += ra; } } }
-            if(nkept>=1 && union_area < UNION_AREA_SHRINK*ba){ for(int k=0;k<nkept;k++) next[nnext++]=kept[k]; changed=true; }
-            else next[nnext++]=b;
-        }
-        memcpy(leaves,next,nnext*sizeof(Box)); nleaves=nnext; if(!changed) break;
-    }
-    for(int i=0;i<nleaves;i++) out_boxes[i] = leaves[i];
-    return nleaves;
-}
-
-static inline int clampi(int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); }
-
-static inline void eval_box_pixels_tp(Worker* w, const CompactTape* tp, Box b){
-    int x0 = clampi((int)ceilf ((b.x0 + 1.0f) * 0.5f * (IMAGE_W - 1)), 0, IMAGE_W);
-    int x1 = clampi((int)floorf((b.x1 + 1.0f) * 0.5f * (IMAGE_W - 1)), -1, IMAGE_W - 1);
-    int y0 = clampi((int)ceilf ((b.y0 + 1.0f) * 0.5f * (IMAGE_H - 1)), 0, IMAGE_H);
-    int y1 = clampi((int)floorf((b.y1 + 1.0f) * 0.5f * (IMAGE_H - 1)), -1, IMAGE_H - 1);
-    if(x1 < x0 || y1 < y0) return;
-    int width = x1 - x0 + 1;
-
-    for(int vi=0; vi<tp->nxops; vi++){
-        int v = tp->xops[vi];
-        Instr in = tp->ins[v];
-        float *dst = w->vals[v];
-        switch(in.op){
-            case OP_CONST:
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = in.fa;
-                break;
-            case OP_VARX:
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = gxcoords[x0 + ix];
-                break;
-            case OP_ADD: {
-                const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = a[ix] + bb[ix];
-            } break;
-            case OP_SUB: {
-                const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = a[ix] - bb[ix];
-            } break;
-            case OP_MUL: {
-                const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = a[ix] * bb[ix];
-            } break;
-            case OP_NEG: {
-                const float *a = w->vals[in.a];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = -a[ix];
-            } break;
-            case OP_SQUARE: {
-                const float *a = w->vals[in.a];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) { float t = a[ix]; dst[ix] = t * t; }
-            } break;
-            case OP_SQRT: {
-                const float *a = w->vals[in.a];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = sqrtf(a[ix]);
-            } break;
-            case OP_MIN: {
-                const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = fminf(a[ix], bb[ix]);
-            } break;
-            case OP_MAX: {
-                const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                #pragma omp simd
-                for(int ix=0; ix<width; ix++) dst[ix] = fmaxf(a[ix], bb[ix]);
-            } break;
-            case OP_VARY:
-                break;
-        }
-    }
-
-    for(int py = y0; py <= y1; py++){
-        float yv = gycoords[py];
-        for(int vi=0; vi<tp->nyops; vi++){
-            int v = tp->yops[vi];
-            Instr in = tp->ins[v];
-            float *dst = w->vals[v];
-            switch(in.op){
-                case OP_CONST:
-                    break;
-                case OP_VARY:
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = yv;
-                    break;
-                case OP_VARX:
-                    break;
-                case OP_ADD: {
-                    const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = a[ix] + bb[ix];
-                } break;
-                case OP_SUB: {
-                    const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = a[ix] - bb[ix];
-                } break;
-                case OP_MUL: {
-                    const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = a[ix] * bb[ix];
-                } break;
-                case OP_NEG: {
-                    const float *a = w->vals[in.a];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = -a[ix];
-                } break;
-                case OP_SQUARE: {
-                    const float *a = w->vals[in.a];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) { float t = a[ix]; dst[ix] = t * t; }
-                } break;
-                case OP_SQRT: {
-                    const float *a = w->vals[in.a];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = sqrtf(a[ix]);
-                } break;
-                case OP_MIN: {
-                    const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = fminf(a[ix], bb[ix]);
-                } break;
-                case OP_MAX: {
-                    const float *a = w->vals[in.a], *bb = w->vals[in.b];
-                    #pragma omp simd
-                    for(int ix=0; ix<width; ix++) dst[ix] = fmaxf(a[ix], bb[ix]);
-                } break;
-            }
-        }
-        const float *rootv = w->vals[tp->root];
-        uint8_t *row = &image[py * IMAGE_W + x0];
-        #pragma omp simd
-        for(int ix=0; ix<width; ix++) if(rootv[ix] < 0.0f) row[ix] = 255;
+  for (int i = 0; i < t->n; i++)
+    if (sign[i] && t->ins[i].op == OP_SUB) {
+      Instr in = t->ins[i];
+      int q = -1;
+      float c = -1;
+      Op op = OP_COUNT;
+      if (in.a >= 0 && in.b >= 0 && t->ins[in.a].op == OP_SQRT && t->mode[in.b] == MODE_SCALAR) {
+        q = t->ins[in.a].a;
+        c = w->scalar[in.b];
+        op = OP_QSUBK;
+      } else if (in.a >= 0 && in.b >= 0 && t->mode[in.a] == MODE_SCALAR && t->ins[in.b].op == OP_SQRT) {
+        q = t->ins[in.b].a;
+        c = w->scalar[in.a];
+        op = OP_KSUBQ;
+      }
+      if (q >= 0 && c >= 0 && nonneg[q]) t->ins[i] = (Instr){op, q, -1, c * c, 0};
     }
 }
-
-static void process_terms_streaming_omp(Worker* w){
-    int local_box_count = 0;
-    Box local_boxes[MAX_BOXES_PER_TERM];
-    #pragma omp for schedule(OMP_SCHEDULE_KIND) nowait
-    for(int i=0;i<nfrontier;i++){
-        CompactTape tp;
-        if(!build_compact_tape_term(w, i, &tp)) continue;
-        int nb = multi_box_refine(w, &tp, local_boxes);
-        for(int k=0;k<nb;k++) eval_box_pixels_tp(w, &tp, local_boxes[k]);
-        local_box_count += nb;
+static inline void mark_needed_inputs(const Tape *t, uint8_t *need, int i) {
+  Instr in = t->ins[i];
+  if (in.a >= 0 && t->mode[in.a] != MODE_SCALAR) need[in.a] = 1;
+  if (in.b >= 0 && t->mode[in.b] != MODE_SCALAR) need[in.b] = 1;
+}
+static inline bool collect_postorder(Worker *w, int fr, int *out_n) {
+  int sp = 0, n = 0;
+  if (++w->mark_id == 0) {
+    memset(w->mark, 0, sizeof(w->mark));
+    w->mark_id = 1;
+  }
+  w->stack[sp++] = fr;
+  w->stack[sp++] = 0;
+  while (sp) {
+    int state = w->stack[--sp], v = w->stack[--sp];
+    if (!state) {
+      if (w->mark[v] == w->mark_id) continue;
+      w->mark[v] = w->mark_id;
+      w->stack[sp++] = v;
+      w->stack[sp++] = 1;
+      if (ins[v].b >= 0) {
+        w->stack[sp++] = ins[v].b;
+        w->stack[sp++] = 0;
+      }
+      if (ins[v].a >= 0) {
+        w->stack[sp++] = ins[v].a;
+        w->stack[sp++] = 0;
+      }
+    } else {
+      if (n >= MAX_LOCAL) return false;
+      w->post[n++] = v;
     }
-    if(local_box_count){
-        #pragma omp atomic
-        nwork_boxes += local_box_count;
+  }
+  *out_n = n;
+  return true;
+}
+static bool build_tape(Worker *w, int fi, Tape *t) {
+  int fr = frontier[fi], n = 0;
+  if (!collect_postorder(w, fr, &n)) return false;
+  t->n = n;
+  t->xl = t->yl = -1;
+  t->nx = t->ny = t->nf = 0;
+  t->fill = 1;
+  uint8_t nonneg[MAX_LOCAL] = {0};
+  for (int i = 0; i < n; i++) w->map[w->post[i]] = i;
+  for (int i = 0; i < n; i++) {
+    Instr in = ins[w->post[i]];
+    if (in.a >= 0) in.a = w->map[in.a];
+    if (in.b >= 0) in.b = w->map[in.b];
+    t->ins[i] = in;
+    t->mode[i] = in.op == OP_CONST                                             ? MODE_SCALAR
+                 : in.op == OP_VARX                                            ? MODE_X
+                 : in.op == OP_VARY                                            ? MODE_Y
+                 : (in.op == OP_NEG || in.op == OP_SQUARE || in.op == OP_SQRT) ? (in.a >= 0 ? t->mode[in.a] : MODE_SCALAR)
+                                                                               : mode2(t->mode[in.a], t->mode[in.b]);
+    if (t->mode[i] == MODE_SCALAR) w->scalar[i] = in.op == OP_CONST ? in.fa : eval_scalar(in.op, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0);
+    analyze_affine(w, t, i);
+    switch (in.op) {
+    case OP_CONST: nonneg[i] = in.fa >= 0; break;
+    case OP_SQUARE:
+    case OP_SQRT: nonneg[i] = 1; break;
+    case OP_ADD:
+    case OP_MUL:
+    case OP_MIN: nonneg[i] = nonneg[in.a] && nonneg[in.b]; break;
+    case OP_MAX: nonneg[i] = nonneg[in.a] || nonneg[in.b]; break;
+    default: break;
     }
+    if (in.op == OP_MIN || (t->mode[i] == MODE_FULL && in.op != OP_MAX)) t->fill = 0;
+    int gv = w->post[i];
+    if (gv == xidx) t->xl = i;
+    if (gv == yidx) t->yl = i;
+    if (gv == fr) t->root = i;
+  }
+  detect_rewrites(w, t, nonneg);
+  uint8_t need[MAX_LOCAL] = {0};
+  need[t->root] = 1;
+  for (int i = n - 1; i >= 0; i--)
+    if (need[i] && !w->aff[i] && t->mode[i] != MODE_SCALAR) mark_needed_inputs(t, need, i);
+  for (int i = 0; i < n; i++) {
+    Instr in = t->ins[i];
+    bool row = t->mode[i] == MODE_FULL;
+    t->arg[i] = (in.a >= 0 && (t->mode[in.a] == MODE_SCALAR || (row && t->mode[in.a] == MODE_Y)) ? 1 : 0) |
+                (in.b >= 0 && (t->mode[in.b] == MODE_SCALAR || (row && t->mode[in.b] == MODE_Y)) ? 2 : 0);
+    if (!need[i]) continue;
+    if (t->mode[i] == MODE_X) t->xop[t->nx++] = i;
+    else if (t->mode[i] == MODE_Y) t->yop[t->ny++] = i;
+    else if (t->mode[i] == MODE_FULL) t->fop[t->nf++] = i;
+  }
+  return true;
 }
 
-static void clear_image_omp(void){
-    #pragma omp for schedule(static) nowait
-    for(int i=0;i<IMAGE_W*IMAGE_H;i++) image[i] = 0;
+static inline void want(Worker *w, int c, Interval iv, Interval f) {
+  if (c < 0) return;
+  iv = inter(iv, f);
+  if (!ok_i(iv)) return;
+  if (w->want_tag[c] == w->tag) w->want[c] = inter(w->want[c], iv);
+  else {
+    w->want[c] = iv;
+    w->want_tag[c] = w->tag;
+  }
+}
+static inline Interval tagged(Worker *w, int c, Interval d) { return c >= 0 && w->want_tag[c] == w->tag ? inter(w->want[c], d) : d; }
+static void back_aff(Worker *w, const Tape *t, int v, Box b) {
+  int xl = t->xl, yl = t->yl;
+  if (!w->aff[v] || (xl < 0 && yl < 0)) return;
+  Interval z = w->want[v], xd = I(b.x0, b.x1), yd = I(b.y0, b.y1), xr = tagged(w, xl, xd), yr = tagged(w, yl, yd);
+  float ax = w->ax[v], ay = w->ay[v], c = w->ac[v];
+  if (xl >= 0 && ax != 0 && ok_i(yr)) want(w, xl, idiv1(I(z.lo - c - fmaxf(ay * yr.lo, ay * yr.hi), z.hi - c - fminf(ay * yr.lo, ay * yr.hi)), ax), xd);
+  xr = tagged(w, xl, xd);
+  if (yl >= 0 && ay != 0 && ok_i(xr)) want(w, yl, idiv1(I(z.lo - c - fmaxf(ax * xr.lo, ax * xr.hi), z.hi - c - fminf(ax * xr.lo, ax * xr.hi)), ay), yd);
+}
+static Interval forward(Worker *w, const Tape *t, Box b) {
+  for (int v = 0; v < t->n; v++) {
+    if (w->aff[v]) {
+      w->fwd[v] = iaff(w->ax[v], w->ay[v], w->ac[v], b);
+      continue;
+    }
+    Instr in = t->ins[v];
+    switch (in.op) {
+    case OP_ADD: w->fwd[v] = iadd(w->fwd[in.a], w->fwd[in.b]); break;
+    case OP_SUB: w->fwd[v] = isub(w->fwd[in.a], w->fwd[in.b]); break;
+    case OP_MUL: w->fwd[v] = imul(w->fwd[in.a], w->fwd[in.b]); break;
+    case OP_NEG: w->fwd[v] = ineg(w->fwd[in.a]); break;
+    case OP_SQUARE: w->fwd[v] = isqr(w->fwd[in.a]); break;
+    case OP_SQRT: w->fwd[v] = isqrt_i(w->fwd[in.a]); break;
+    case OP_MIN: w->fwd[v] = I(fminf(w->fwd[in.a].lo, w->fwd[in.b].lo), fminf(w->fwd[in.a].hi, w->fwd[in.b].hi)); break;
+    case OP_MAX: w->fwd[v] = I(fmaxf(w->fwd[in.a].lo, w->fwd[in.b].lo), fmaxf(w->fwd[in.a].hi, w->fwd[in.b].hi)); break;
+    case OP_QSUBK: w->fwd[v] = isub(w->fwd[in.a], I(in.fa, in.fa)); break;
+    case OP_KSUBQ: w->fwd[v] = isub(I(in.fa, in.fa), w->fwd[in.a]); break;
+    default: break;
+    }
+  }
+  return w->fwd[t->root];
+}
+static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
+  Interval r = forward(w, t, b);
+  if (!ok_i(r) || r.lo >= 0) return false;
+  if (++w->tag == 0) {
+    memset(w->want_tag, 0, sizeof(w->want_tag));
+    w->tag = 1;
+  }
+  w->want[t->root] = I(NEG_INF, 0);
+  w->want_tag[t->root] = w->tag;
+  for (int v = t->n - 1; v >= 0; v--)
+    if (w->want_tag[v] == w->tag) {
+      if (w->aff[v]) {
+        back_aff(w, t, v, b);
+        continue;
+      }
+      Instr in = t->ins[v];
+      Interval z = w->want[v], a = in.a >= 0 ? w->fwd[in.a] : I(in.fa, in.fa), bb = in.b >= 0 ? w->fwd[in.b] : I(in.fb, in.fb);
+      switch (in.op) {
+      case OP_ADD:
+        want(w, in.a, I(z.lo - bb.hi, z.hi - bb.lo), a);
+        want(w, in.b, I(z.lo - a.hi, z.hi - a.lo), bb);
+        break;
+      case OP_SUB:
+        want(w, in.a, I(z.lo + bb.lo, z.hi + bb.hi), a);
+        want(w, in.b, I(a.lo - z.hi, a.hi - z.lo), bb);
+        break;
+      case OP_MUL:
+        if (bb.lo > 0 || bb.hi < 0) want(w, in.a, idiv(z, bb), a);
+        if (a.lo > 0 || a.hi < 0) want(w, in.b, idiv(z, a), bb);
+        break;
+      case OP_NEG: want(w, in.a, I(-z.hi, -z.lo), a); break;
+      case OP_SQUARE: want(w, in.a, I(-sqrtf(fmaxf(0, z.hi)), sqrtf(fmaxf(0, z.hi))), a); break;
+      case OP_SQRT:
+        if (z.hi >= 0) want(w, in.a, I(fmaxf(0, z.lo) * fmaxf(0, z.lo), fmaxf(0, z.hi) * fmaxf(0, z.hi)), a);
+        break;
+      case OP_QSUBK: want(w, in.a, I(z.lo + in.fa, z.hi + in.fa), a); break;
+      case OP_KSUBQ: want(w, in.a, I(in.fa - z.hi, in.fa - z.lo), a); break;
+      case OP_MAX:
+        want(w, in.a, I(NEG_INF, z.hi), a);
+        want(w, in.b, I(NEG_INF, z.hi), bb);
+        break;
+      case OP_MIN:
+        want(w, in.a, I(z.lo, a.hi), a);
+        want(w, in.b, I(z.lo, bb.hi), bb);
+        if (a.lo > z.hi) want(w, in.b, I(NEG_INF, z.hi), bb);
+        if (bb.lo > z.hi) want(w, in.a, I(NEG_INF, z.hi), a);
+        break;
+      default: break;
+      }
+      back_aff(w, t, v, b);
+    }
+  Interval x = tagged(w, t->xl, I(b.x0, b.x1));
+  Interval y = tagged(w, t->yl, I(b.y0, b.y1));
+  if (!ok_i(x) || !ok_i(y)) return false;
+  *out = (Box){x.lo, x.hi, y.lo, y.hi};
+  return true;
+}
+static bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
+  for (int i = 0; i < rounds; i++) {
+    Box old = b, n;
+    if (!contract_once(w, t, b, &n)) return false;
+    b = (Box){fmaxf(b.x0, n.x0), fminf(b.x1, n.x1), fmaxf(b.y0, n.y0), fminf(b.y1, n.y1)};
+    if (b.x0 > b.x1 || b.y0 > b.y1) return false;
+    if (!memcmp(&old, &b, sizeof b)) break;
+  }
+  *out = b;
+  return true;
+}
+static int refine_boxes(Worker *w, const Tape *t, Box *out) {
+  Box leaves[MAX_BOXES_PER_TERM], base;
+  if (!refine(w, t, (Box){-1, 1, -1, 1}, BASE_REFINE_ROUNDS, &base) || area(base) <= 0) return 0;
+  leaves[0] = base;
+  int nl = 1;
+  for (int d = 0; d < 5; d++) {
+    Box next[MAX_BOXES_PER_TERM];
+    int nn = 0;
+    bool changed = false;
+    for (int i = 0; i < nl; i++) {
+      Box b = leaves[i];
+      float ba = area(b);
+      if (ba <= 0.006f || nn + 2 > MAX_BOXES_PER_TERM) {
+        next[nn++] = b;
+        continue;
+      }
+      float ua = 0;
+      Box kids[2], keep[2];
+      float dx = b.x1 - b.x0, dy = b.y1 - b.y0;
+      if (dx >= dy) {
+        float m = .5f * (b.x0 + b.x1);
+        kids[0] = (Box){b.x0, m, b.y0, b.y1};
+        kids[1] = (Box){m, b.x1, b.y0, b.y1};
+      } else {
+        float m = .5f * (b.y0 + b.y1);
+        kids[0] = (Box){b.x0, b.x1, b.y0, m};
+        kids[1] = (Box){b.x0, b.x1, m, b.y1};
+      }
+      int nk = 0;
+      for (int k = 0; k < 2; k++)
+        if (refine(w, t, kids[k], CHILD_REFINE_ROUNDS, &keep[nk]) && area(keep[nk]) > 0) ua += area(keep[nk++]);
+      if (nk && ua < 0.95f * ba) {
+        for (int k = 0; k < nk; k++) next[nn++] = keep[k];
+        changed = true;
+      } else next[nn++] = b;
+    }
+    memcpy(leaves, next, nn * sizeof(Box));
+    nl = nn;
+    if (!changed) break;
+  }
+  memcpy(out, leaves, nl * sizeof(Box));
+  return nl;
 }
 
-static void run_full_pipeline_omp(Worker* w){
-    #pragma omp single
-    extract_frontier();
-    #pragma omp single
-    nwork_boxes = 0;
-    clear_image_omp();
-    #pragma omp barrier
-    process_terms_streaming_omp(w);
-    #pragma omp barrier
+static inline PixelBox pbox(Box b) {
+  return (PixelBox){clampi((int)ceilf((b.x0 + 1) * .5f * (IMAGE_W - 1)), 0, IMAGE_W), clampi((int)floorf((b.x1 + 1) * .5f * (IMAGE_W - 1)), -1, IMAGE_W - 1),
+                    clampi((int)ceilf((b.y0 + 1) * .5f * (IMAGE_H - 1)), 0, IMAGE_H), clampi((int)floorf((b.y1 + 1) * .5f * (IMAGE_H - 1)), -1, IMAGE_H - 1)};
+}
+static inline void fill_box(PixelBox p) {
+  int n = p.x1 - p.x0 + 1;
+  for (int y = p.y0; y <= p.y1; y++) memset(&image[y * IMAGE_W + p.x0], 255, n);
+}
+static inline Box pdom(PixelBox p) { return (Box){gx[p.x0], gx[p.x1], gy[p.y0], gy[p.y1]}; }
+static inline void push_split(PixelBox p, PixelBox *st, int *sp) {
+  int pw = p.x1 - p.x0 + 1, ph = p.y1 - p.y0 + 1;
+  if (pw >= ph) {
+    int m = (p.x0 + p.x1) >> 1;
+    st[(*sp)++] = (PixelBox){m + 1, p.x1, p.y0, p.y1};
+    p.x1 = m;
+  } else {
+    int m = (p.y0 + p.y1) >> 1;
+    st[(*sp)++] = (PixelBox){p.x0, p.x1, m + 1, p.y1};
+    p.y1 = m;
+  }
+  st[(*sp)++] = p;
+}
+static inline void eval_affine_vec(Worker *w, int v, int x0, float yc, int n) { VEC(w->val[v], n, fmaf(w->ax[v], gx[x0 + ix], yc)); }
+static void vec_op(Op op, float *d, const float *a, const float *b, float av, float bv, bool as, bool bs, int n) {
+  switch (op) {
+  case OP_NEG: VEC(d, n, -a[ix]); break;
+  case OP_SQUARE: VEC(d, n, a[ix] * a[ix]); break;
+  case OP_SQRT: VEC(d, n, sqrtf(a[ix])); break;
+  case OP_ADD: VEC(d, n, ARG(as, av, a, ix) + ARG(bs, bv, b, ix)); break;
+  case OP_SUB: VEC(d, n, ARG(as, av, a, ix) - ARG(bs, bv, b, ix)); break;
+  case OP_MUL: VEC(d, n, ARG(as, av, a, ix) * ARG(bs, bv, b, ix)); break;
+  case OP_MIN: VEC(d, n, fminf(ARG(as, av, a, ix), ARG(bs, bv, b, ix))); break;
+  case OP_MAX: VEC(d, n, fmaxf(ARG(as, av, a, ix), ARG(bs, bv, b, ix))); break;
+  default: break;
+  }
+}
+static inline void eval_vec_node(Worker *w, const Tape *t, int v, int x0, float yy, int n) {
+  Instr in = t->ins[v];
+  if (w->aff[v]) {
+    eval_affine_vec(w, v, x0, fmaf(w->ay[v], yy, w->ac[v]), n);
+    return;
+  }
+  if (in.op == OP_QSUBK) {
+    VEC(w->val[v], n, w->val[in.a][ix] - in.fa);
+    return;
+  }
+  if (in.op == OP_KSUBQ) {
+    VEC(w->val[v], n, in.fa - w->val[in.a][ix]);
+    return;
+  }
+  vec_op(in.op, w->val[v], w->val[in.a], in.b >= 0 ? w->val[in.b] : NULL, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0, t->arg[v] & 1, t->arg[v] & 2, n);
+}
+static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
+  int x0 = p.x0, x1 = p.x1, y0 = p.y0, y1 = p.y1, n = x1 - x0 + 1;
+  if (x1 < x0 || y1 < y0) return;
+  for (int ii = 0; ii < t->nx; ii++) eval_vec_node(w, t, t->xop[ii], x0, 0, n);
+  for (int py = y0; py <= y1; py++) {
+    float yy = gy[py];
+    uint8_t *row = &image[py * IMAGE_W + x0];
+    for (int ii = 0; ii < t->ny; ii++) {
+      int v = t->yop[ii];
+      Instr in = t->ins[v];
+      if (w->aff[v]) w->scalar[v] = fmaf(w->ay[v], yy, w->ac[v]);
+      else if (in.op == OP_QSUBK) w->scalar[v] = w->scalar[in.a] - in.fa;
+      else if (in.op == OP_KSUBQ) w->scalar[v] = in.fa - w->scalar[in.a];
+      else w->scalar[v] = eval_scalar(in.op, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0);
+    }
+    for (int ii = 0; ii < t->nf; ii++) eval_vec_node(w, t, t->fop[ii], x0, yy, n);
+    if (t->mode[t->root] == MODE_SCALAR || t->mode[t->root] == MODE_Y) {
+      if (w->scalar[t->root] < 0) memset(row, 255, n);
+    } else {
+      float *r = w->val[t->root];
+      _Pragma("omp simd") for (int ix = 0; ix < n; ix++) if (r[ix] < 0) row[ix] = 255;
+    }
+  }
+}
+static void eval_box(Worker *w, const Tape *t, Box b) {
+  PixelBox st[128], p = pbox(b);
+  int sp = 0;
+  if (p.x1 < p.x0 || p.y1 < p.y0) return;
+  if (t->fill) {
+    fill_box(p);
+    return;
+  }
+  st[sp++] = p;
+  while (sp) {
+    p = st[--sp];
+    int pw = p.x1 - p.x0 + 1, ph = p.y1 - p.y0 + 1;
+    if (pw * ph <= 4096) {
+      eval_box_raw(w, t, p);
+      continue;
+    }
+    Interval r = forward(w, t, pdom(p));
+    if (!ok_i(r) || r.lo >= 0) continue;
+    if (r.hi < 0) {
+      fill_box(p);
+      continue;
+    }
+    if (sp + 2 >= 128) {
+      eval_box_raw(w, t, p);
+      continue;
+    }
+    push_split(p, st, &sp);
+  }
 }
 
-static int checksum_image(void){
-    int sum = 0;
-    for(int i=0;i<IMAGE_W*IMAGE_H;i++) sum += image[i];
-    return sum;
+static void render_terms(Worker *w) {
+  Box boxes[MAX_BOXES_PER_TERM];
+#pragma omp for schedule(dynamic, 1) nowait
+  for (int i = 0; i < nfrontier; i++) {
+    Tape t;
+    if (!build_tape(w, i, &t)) continue;
+    int nb = refine_boxes(w, &t, boxes);
+    for (int k = 0; k < nb; k++) eval_box(w, &t, boxes[k]);
+  }
 }
-
-static void write_image_ppm(const char* path){
-    FILE* f = fopen(path, "wb");
-    if(!f){
-        perror("fopen");
-        exit(1);
-    }
-    fprintf(f, "P6\n%d %d\n255\n", IMAGE_W, IMAGE_H);
-    for(int y = IMAGE_H - 1; y >= 0; y--){
-        const uint8_t* row = &image[y * IMAGE_W];
-        for(int x = 0; x < IMAGE_W; x++){
-            uint8_t pixel[3] = { row[x], row[x], row[x] };
-            if(fwrite(pixel, sizeof(pixel), 1, f) != 1){
-                perror("fwrite");
-                fclose(f);
-                exit(1);
-            }
-        }
-    }
-    if(fclose(f) != 0){
-        perror("fclose");
-        exit(1);
-    }
-}
-
-static int run_full_pipeline_parallel(void){
-    #pragma omp parallel
-    {
-        Worker w;
-        build_worker_init(&w);
-        run_full_pipeline_omp(&w);
-    }
-    return nwork_boxes;
-}
-
-int main(int argc, char** argv){ init_coords();
-    const char* path = argc>1? argv[1] : "/mnt/data/prospero.vm";
-    const char* ppm_path = argc>2? argv[2] : NULL;
-    load_vm(path);
-    int max_threads=1;
-    #ifdef _OPENMP
-    max_threads = omp_get_max_threads();
-    #endif
-    int warm_boxes = run_full_pipeline_parallel();
-    int warm_sum = checksum_image();
-    printf("Full pipeline + frontier extraction + raster/eval benchmark\n");
-    printf("instructions: %d\nfrontier_terms: %d\nimage: %dx%d\nmax_threads: %d\n", nins, nfrontier, IMAGE_W, IMAGE_H, max_threads);
-    const int runs=BENCH_RUNS; double times[runs]; int boxes=-1, sum=-1;
-    double timed_t0 = 0.0;
-    #pragma omp parallel
-    {
-        Worker w;
-        build_worker_init(&w);
-        for(int r=0;r<runs;r++){
-            #pragma omp single
-            timed_t0 = now_sec();
-            run_full_pipeline_omp(&w);
-            #pragma omp single
-            {
-                double t1=now_sec();
-                times[r]=(t1-timed_t0)*1000.0;
-                boxes = nwork_boxes;
-                sum = checksum_image();
-                if(boxes!=warm_boxes || sum!=warm_sum){ fprintf(stderr,"mismatch boxes=%d/%d checksum=%d/%d\n", boxes, warm_boxes, sum, warm_sum); exit(1); }
-            }
-        }
-    }
-    double agg=0,minv=1e9,maxv=0; for(int i=0;i<runs;i++){ agg+=times[i]; if(times[i]<minv) minv=times[i]; if(times[i]>maxv) maxv=times[i]; }
-    printf("threads=%d boxes=%d checksum=%d runs_ms:", max_threads, boxes, sum);
-    for(int i=0;i<runs;i++) printf(" %.3f", times[i]);
-    printf("\nmean_ms=%.3f min_ms=%.3f max_ms=%.3f\n", agg/runs, minv, maxv);
-    if(ppm_path) write_image_ppm(ppm_path);
-    return 0;
+void vm_render_frame(Worker *w) {
+#pragma omp single nowait
+  extract_frontier();
+#pragma omp for schedule(static) nowait
+  for (int y = 0; y < IMAGE_H; y++) memset(&image[y * IMAGE_W], 0, IMAGE_W);
+#pragma omp barrier
+  render_terms(w);
+#pragma omp barrier
 }
