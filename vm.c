@@ -1,5 +1,17 @@
 #include "vm.h"
 
+#if defined(VM_ENABLE_STREAMING_SVE) && defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SME2)
+#include <arm_sve.h>
+#define VM_STREAMING __arm_streaming
+#define VM_USE_STREAMING_SVE 1
+#else
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#define VM_STREAMING
+#define VM_USE_STREAMING_SVE 0
+#endif
+
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
@@ -449,39 +461,174 @@ static inline void push_split(PixelBox p, PixelBox *st, int *sp) {
   }
   st[(*sp)++] = p;
 }
+#if VM_USE_STREAMING_SVE
+static inline svfloat32_t sv_arg(svbool_t pg, const float *p, float v, bool scalar, int i) VM_STREAMING { return scalar ? svdup_n_f32(v) : svld1(pg, p + i); }
+static inline void eval_affine_vec(Worker *w, int v, int x0, float yc, int n) VM_STREAMING {
+  svfloat32_t ax = svdup_n_f32(w->ax[v]), c = svdup_n_f32(yc);
+  float *dst = w->val[v];
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    svst1(pg, dst + i, svmla_x(pg, c, svld1(pg, gx + x0 + i), ax));
+    i += svcntw();
+  }
+}
+static void vec_op(Op op, float *d, const float *a, const float *b, float av, float bv, bool as, bool bs, int n) VM_STREAMING {
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    svfloat32_t va = sv_arg(pg, a, av, as, i), vb = b || bs ? sv_arg(pg, b, bv, bs, i) : svdup_n_f32(0), r = va;
+    switch (op) {
+    case OP_NEG: r = svneg_x(pg, va); break;
+    case OP_SQUARE: r = svmul_x(pg, va, va); break;
+    case OP_SQRT: r = svsqrt_x(pg, va); break;
+    case OP_ADD: r = svadd_x(pg, va, vb); break;
+    case OP_SUB: r = svsub_x(pg, va, vb); break;
+    case OP_MUL: r = svmul_x(pg, va, vb); break;
+    case OP_MIN: r = svmin_x(pg, va, vb); break;
+    case OP_MAX: r = svmax_x(pg, va, vb); break;
+    default: break;
+    }
+    svst1(pg, d + i, r);
+    i += svcntw();
+  }
+}
+static inline void qsubk_vec(float *restrict d, const float *restrict a, float k, int n) VM_STREAMING {
+  svfloat32_t c = svdup_n_f32(k);
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    svst1(pg, d + i, svsub_x(pg, svld1(pg, a + i), c));
+    i += svcntw();
+  }
+}
+static inline void ksubq_vec(float *restrict d, const float *restrict a, float k, int n) VM_STREAMING {
+  svfloat32_t c = svdup_n_f32(k);
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    svst1(pg, d + i, svsub_x(pg, c, svld1(pg, a + i)));
+    i += svcntw();
+  }
+}
+static inline void store_negative_row(uint8_t *restrict row, const float *restrict r, int n) VM_STREAMING {
+  svuint32_t fill = svdup_n_u32(255);
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    svbool_t m = svcmplt(pg, svld1(pg, r + i), svdup_n_f32(0));
+    svst1b_u32(m, row + i, fill);
+    i += svcntw();
+  }
+}
+static inline void fill_row_255(uint8_t *row, int n) VM_STREAMING {
+  svuint8_t fill = svdup_n_u8(255);
+  for (int i = 0; i < n;) {
+    svbool_t pg = svwhilelt_b8(i, n);
+    svst1_u8(pg, row + i, fill);
+    i += svcntb();
+  }
+}
+#else
 static inline void eval_affine_vec(Worker *w, int v, int x0, float yc, int n) { VEC(w->val[v], n, fmaf(w->ax[v], gx[x0 + ix], yc)); }
-static void vec_op(Op op, float *d, const float *a, const float *b, float av, float bv, bool as, bool bs, int n) {
+static void vec_op(Op op, float *restrict d, const float *restrict a, const float *restrict b, float av, float bv, uint8_t arg, int n) {
   switch (op) {
-  case OP_NEG: VEC(d, n, -a[ix]); break;
-  case OP_SQUARE: VEC(d, n, a[ix] * a[ix]); break;
-  case OP_SQRT: VEC(d, n, sqrtf(a[ix])); break;
-  case OP_ADD: VEC(d, n, ARG(as, av, a, ix) + ARG(bs, bv, b, ix)); break;
-  case OP_SUB: VEC(d, n, ARG(as, av, a, ix) - ARG(bs, bv, b, ix)); break;
-  case OP_MUL: VEC(d, n, ARG(as, av, a, ix) * ARG(bs, bv, b, ix)); break;
-  case OP_MIN: VEC(d, n, fminf(ARG(as, av, a, ix), ARG(bs, bv, b, ix))); break;
-  case OP_MAX: VEC(d, n, fmaxf(ARG(as, av, a, ix), ARG(bs, bv, b, ix))); break;
+  case OP_NEG:
+    if (arg & 1) VEC(d, n, -av);
+    else VEC(d, n, -a[ix]);
+    break;
+  case OP_SQUARE:
+    if (arg & 1) VEC(d, n, av * av);
+    else VEC(d, n, a[ix] * a[ix]);
+    break;
+  case OP_SQRT:
+    if (arg & 1) VEC(d, n, sqrtf(av));
+    else VEC(d, n, sqrtf(a[ix]));
+    break;
+  case OP_ADD:
+    if (arg == 0) VEC(d, n, a[ix] + b[ix]);
+    else if (arg == 1) VEC(d, n, av + b[ix]);
+    else if (arg == 2) VEC(d, n, a[ix] + bv);
+    else VEC(d, n, av + bv);
+    break;
+  case OP_SUB:
+    if (arg == 0) VEC(d, n, a[ix] - b[ix]);
+    else if (arg == 1) VEC(d, n, av - b[ix]);
+    else if (arg == 2) VEC(d, n, a[ix] - bv);
+    else VEC(d, n, av - bv);
+    break;
+  case OP_MUL:
+    if (arg == 0) VEC(d, n, a[ix] * b[ix]);
+    else if (arg == 1) VEC(d, n, av * b[ix]);
+    else if (arg == 2) VEC(d, n, a[ix] * bv);
+    else VEC(d, n, av * bv);
+    break;
+  case OP_MIN:
+    if (arg == 0) VEC(d, n, fminf(a[ix], b[ix]));
+    else if (arg == 1) VEC(d, n, fminf(av, b[ix]));
+    else if (arg == 2) VEC(d, n, fminf(a[ix], bv));
+    else VEC(d, n, fminf(av, bv));
+    break;
+  case OP_MAX:
+    if (arg == 0) VEC(d, n, fmaxf(a[ix], b[ix]));
+    else if (arg == 1) VEC(d, n, fmaxf(av, b[ix]));
+    else if (arg == 2) VEC(d, n, fmaxf(a[ix], bv));
+    else VEC(d, n, fmaxf(av, bv));
+    break;
   default: break;
   }
 }
-static inline void eval_vec_node(Worker *w, const Tape *t, int v, int x0, float yy, int n) {
+static inline void qsubk_vec(float *restrict d, const float *restrict a, float k, int n) { VEC(d, n, a[ix] - k); }
+static inline void ksubq_vec(float *restrict d, const float *restrict a, float k, int n) { VEC(d, n, k - a[ix]); }
+#if defined(__ARM_NEON)
+static inline void store_negative_row(uint8_t *restrict row, const float *restrict r, int n) {
+  int ix = 0;
+  float32x4_t z = vdupq_n_f32(0);
+  for (; ix + 16 <= n; ix += 16) {
+    uint16x4_t a = vmovn_u32(vcltq_f32(vld1q_f32(r + ix), z));
+    uint16x4_t b = vmovn_u32(vcltq_f32(vld1q_f32(r + ix + 4), z));
+    uint16x4_t c = vmovn_u32(vcltq_f32(vld1q_f32(r + ix + 8), z));
+    uint16x4_t d = vmovn_u32(vcltq_f32(vld1q_f32(r + ix + 12), z));
+    uint8x8_t lo = vmovn_u16(vcombine_u16(a, b));
+    uint8x8_t hi = vmovn_u16(vcombine_u16(c, d));
+    vst1q_u8(row + ix, vorrq_u8(vld1q_u8(row + ix), vcombine_u8(lo, hi)));
+  }
+  for (; ix + 8 <= n; ix += 8) {
+    uint16x4_t lo = vmovn_u32(vcltq_f32(vld1q_f32(r + ix), z));
+    uint16x4_t hi = vmovn_u32(vcltq_f32(vld1q_f32(r + ix + 4), z));
+    uint8x8_t mask = vmovn_u16(vcombine_u16(lo, hi));
+    vst1_u8(row + ix, vorr_u8(vld1_u8(row + ix), mask));
+  }
+  for (; ix < n; ix++)
+    if (r[ix] < 0) row[ix] = 255;
+}
+#else
+static inline void store_negative_row(uint8_t *restrict row, const float *restrict r, int n) {
+  _Pragma("omp simd") for (int ix = 0; ix < n; ix++) if (r[ix] < 0) row[ix] = 255;
+}
+#endif
+static inline void fill_row_255(uint8_t *row, int n) { memset(row, 255, n); }
+#endif
+static inline void eval_vec_node(Worker *w, const Tape *t, int v, int x0, float yy, int n) VM_STREAMING {
   Instr in = t->ins[v];
   if (w->aff[v]) {
     eval_affine_vec(w, v, x0, fmaf(w->ay[v], yy, w->ac[v]), n);
     return;
   }
   if (in.op == OP_QSUBK) {
-    VEC(w->val[v], n, w->val[in.a][ix] - in.fa);
+    qsubk_vec(w->val[v], w->val[in.a], in.fa, n);
     return;
   }
   if (in.op == OP_KSUBQ) {
-    VEC(w->val[v], n, in.fa - w->val[in.a][ix]);
+    ksubq_vec(w->val[v], w->val[in.a], in.fa, n);
     return;
   }
+#if VM_USE_STREAMING_SVE
   vec_op(in.op, w->val[v], w->val[in.a], in.b >= 0 ? w->val[in.b] : NULL, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0, t->arg[v] & 1, t->arg[v] & 2, n);
+#else
+  vec_op(in.op, w->val[v], w->val[in.a], in.b >= 0 ? w->val[in.b] : NULL, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0, t->arg[v], n);
+#endif
 }
-static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
+static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) VM_STREAMING {
   int x0 = p.x0, x1 = p.x1, y0 = p.y0, y1 = p.y1, n = x1 - x0 + 1;
   if (x1 < x0 || y1 < y0) return;
+  int root = t->root;
+  bool root_row_scalar = t->mode[root] == MODE_SCALAR || t->mode[root] == MODE_Y;
   for (int ii = 0; ii < t->nx; ii++) eval_vec_node(w, t, t->xop[ii], x0, 0, n);
   for (int py = y0; py <= y1; py++) {
     float yy = gy[py];
@@ -495,15 +642,14 @@ static void eval_box_raw(Worker *w, const Tape *t, PixelBox p) {
       else w->scalar[v] = eval_scalar(in.op, w->scalar[in.a], in.b >= 0 ? w->scalar[in.b] : 0);
     }
     for (int ii = 0; ii < t->nf; ii++) eval_vec_node(w, t, t->fop[ii], x0, yy, n);
-    if (t->mode[t->root] == MODE_SCALAR || t->mode[t->root] == MODE_Y) {
-      if (w->scalar[t->root] < 0) memset(row, 255, n);
+    if (root_row_scalar) {
+      if (w->scalar[root] < 0) fill_row_255(row, n);
     } else {
-      float *r = w->val[t->root];
-      _Pragma("omp simd") for (int ix = 0; ix < n; ix++) if (r[ix] < 0) row[ix] = 255;
+      store_negative_row(row, w->val[root], n);
     }
   }
 }
-static void eval_box(Worker *w, const Tape *t, Box b) {
+static void eval_box(Worker *w, const Tape *t, Box b) VM_STREAMING {
   PixelBox st[128], p = pbox(b);
   int sp = 0;
   if (p.x1 < p.x0 || p.y1 < p.y0) return;
