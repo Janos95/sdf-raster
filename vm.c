@@ -5,9 +5,7 @@
 #include <string.h>
 
 enum {
-  MAX_BOXES_PER_TERM = 16,
-  BASE_REFINE_ROUNDS = 6,
-  CHILD_REFINE_ROUNDS = 3
+  MAX_REGION_POINTS = MAX_LOCAL * 2 + 8
 };
 #define NEG_INF (-1e30f)
 #define VEC(dst, n, expr)                                                                                                                                      \
@@ -21,6 +19,10 @@ typedef struct {
 typedef struct {
   int x0, x1, y0, y1;
 } PixelBox;
+typedef struct {
+  int n;
+  float x[MAX_REGION_POINTS], y[MAX_REGION_POINTS];
+} Region;
 typedef struct {
   uint16_t n, root;
   int16_t xl, yl;
@@ -54,7 +56,6 @@ static inline Interval isqrt_i(Interval a) { return a.hi < 0 ? I(1, 0) : I(sqrtf
 static inline Interval idiv(Interval z, Interval d) {
   return I(min4(z.lo / d.lo, z.lo / d.hi, z.hi / d.lo, z.hi / d.hi), max4(z.lo / d.lo, z.lo / d.hi, z.hi / d.lo, z.hi / d.hi));
 }
-static inline Interval idiv1(Interval z, float d) { return I(fminf(z.lo / d, z.hi / d), fmaxf(z.lo / d, z.hi / d)); }
 static inline Interval iaff(float ax, float ay, float c, Box b) {
   float x0 = ax * b.x0, x1 = ax * b.x1, y0 = ay * b.y0, y1 = ay * b.y1;
   return I(fminf(x0, x1) + fminf(y0, y1) + c, fmaxf(x0, x1) + fmaxf(y0, y1) + c);
@@ -282,15 +283,78 @@ static inline void want(Worker *w, int c, Interval iv, Interval f) {
     w->want_tag[c] = w->tag;
   }
 }
-static inline Interval tagged(Worker *w, int c, Interval d) { return c >= 0 && w->want_tag[c] == w->tag ? inter(w->want[c], d) : d; }
-static void back_aff(Worker *w, const Tape *t, int v, Box b) {
-  int xl = t->xl, yl = t->yl;
-  if (!w->aff[v] || (xl < 0 && yl < 0)) return;
-  Interval z = w->want[v], xd = I(b.x0, b.x1), yd = I(b.y0, b.y1), xr = tagged(w, xl, xd), yr = tagged(w, yl, yd);
-  float ax = w->ax[v], ay = w->ay[v], c = w->ac[v];
-  if (xl >= 0 && ax != 0 && ok_i(yr)) want(w, xl, idiv1(I(z.lo - c - fmaxf(ay * yr.lo, ay * yr.hi), z.hi - c - fminf(ay * yr.lo, ay * yr.hi)), ax), xd);
-  xr = tagged(w, xl, xd);
-  if (yl >= 0 && ay != 0 && ok_i(xr)) want(w, yl, idiv1(I(z.lo - c - fmaxf(ax * xr.lo, ax * xr.hi), z.hi - c - fminf(ax * xr.lo, ax * xr.hi)), ay), yd);
+static void region_from_box(Region *r, Box b) {
+  r->n = 4;
+  r->x[0] = b.x0;
+  r->y[0] = b.y0;
+  r->x[1] = b.x1;
+  r->y[1] = b.y0;
+  r->x[2] = b.x1;
+  r->y[2] = b.y1;
+  r->x[3] = b.x0;
+  r->y[3] = b.y1;
+}
+static bool region_clip(Region *r, float ax, float ay, float hi) {
+  float ox[MAX_REGION_POINTS], oy[MAX_REGION_POINTS];
+  int m = 0;
+  if (!r->n) return false;
+  float px = r->x[r->n - 1], py = r->y[r->n - 1], pv = ax * px + ay * py - hi;
+  bool pin = pv <= 1e-6f;
+  for (int i = 0; i < r->n; i++) {
+    float cx = r->x[i], cy = r->y[i], cv = ax * cx + ay * cy - hi;
+    bool cin = cv <= 1e-6f;
+    if (pin != cin) {
+      if (m >= MAX_REGION_POINTS) return false;
+      float t = pv / (pv - cv);
+      ox[m] = px + t * (cx - px);
+      oy[m++] = py + t * (cy - py);
+    }
+    if (cin) {
+      if (m >= MAX_REGION_POINTS) return false;
+      ox[m] = cx;
+      oy[m++] = cy;
+    }
+    px = cx;
+    py = cy;
+    pv = cv;
+    pin = cin;
+  }
+  memcpy(r->x, ox, m * sizeof(float));
+  memcpy(r->y, oy, m * sizeof(float));
+  r->n = m;
+  return m != 0;
+}
+static bool region_meet_linear(Region *r, float ax, float ay, float c, Interval z) {
+  if (ax == 0 && ay == 0) return z.lo <= c && c <= z.hi;
+  if (z.lo <= -1e20f && z.hi >= 1e20f) return true;
+  if (z.hi < 1e20f && !region_clip(r, ax, ay, z.hi - c)) return false;
+  if (z.lo > -1e20f && !region_clip(r, -ax, -ay, c - z.lo)) return false;
+  return true;
+}
+static bool region_bbox(const Region *r, Box *out) {
+  if (!r->n) return false;
+  Box b = {r->x[0], r->x[0], r->y[0], r->y[0]};
+  for (int i = 1; i < r->n; i++) {
+    b.x0 = fminf(b.x0, r->x[i]);
+    b.x1 = fmaxf(b.x1, r->x[i]);
+    b.y0 = fminf(b.y0, r->y[i]);
+    b.y1 = fmaxf(b.y1, r->y[i]);
+  }
+  *out = b;
+  return true;
+}
+static bool restrict_region(Worker *w, const Tape *t, Box b, Box *out) {
+  Region r;
+  region_from_box(&r, b);
+  for (int v = 0; v < t->n; v++)
+    if (w->want_tag[v] == w->tag && w->aff[v] && !region_meet_linear(&r, w->ax[v], w->ay[v], w->ac[v], w->want[v])) return false;
+  return region_bbox(&r, out);
+}
+static inline void next_want_tag(Worker *w) {
+  if (++w->tag == 0) {
+    memset(w->want_tag, 0, sizeof(w->want_tag));
+    w->tag = 1;
+  }
 }
 static Interval forward(Worker *w, const Tape *t, Box b) {
   for (int v = 0; v < t->n; v++) {
@@ -318,18 +382,12 @@ static Interval forward(Worker *w, const Tape *t, Box b) {
 static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
   Interval r = forward(w, t, b);
   if (!ok_i(r) || r.lo >= 0) return false;
-  if (++w->tag == 0) {
-    memset(w->want_tag, 0, sizeof(w->want_tag));
-    w->tag = 1;
-  }
+  next_want_tag(w);
   w->want[t->root] = I(NEG_INF, 0);
   w->want_tag[t->root] = w->tag;
   for (int v = t->n - 1; v >= 0; v--)
     if (w->want_tag[v] == w->tag) {
-      if (w->aff[v]) {
-        back_aff(w, t, v, b);
-        continue;
-      }
+      if (w->aff[v]) continue;
       Instr in = t->ins[v];
       Interval z = w->want[v], a = in.a >= 0 ? w->fwd[in.a] : I(in.fa, in.fa), bb = in.b >= 0 ? w->fwd[in.b] : I(in.fb, in.fb);
       switch (in.op) {
@@ -350,7 +408,9 @@ static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
       case OP_SQRT:
         if (z.hi >= 0) want(w, in.a, I(fmaxf(0, z.lo) * fmaxf(0, z.lo), fmaxf(0, z.hi) * fmaxf(0, z.hi)), a);
         break;
-      case OP_QSUBK: want(w, in.a, I(z.lo + in.fa, z.hi + in.fa), a); break;
+      case OP_QSUBK:
+        want(w, in.a, I(z.lo + in.fa, z.hi + in.fa), a);
+        break;
       case OP_KSUBQ: want(w, in.a, I(in.fa - z.hi, in.fa - z.lo), a); break;
       case OP_MAX:
         want(w, in.a, I(NEG_INF, z.hi), a);
@@ -364,69 +424,9 @@ static bool contract_once(Worker *w, const Tape *t, Box b, Box *out) {
         break;
       default: break;
       }
-      back_aff(w, t, v, b);
     }
-  Interval x = tagged(w, t->xl, I(b.x0, b.x1));
-  Interval y = tagged(w, t->yl, I(b.y0, b.y1));
-  if (!ok_i(x) || !ok_i(y)) return false;
-  *out = (Box){x.lo, x.hi, y.lo, y.hi};
-  return true;
+  return restrict_region(w, t, b, out);
 }
-static bool refine(Worker *w, const Tape *t, Box b, int rounds, Box *out) {
-  for (int i = 0; i < rounds; i++) {
-    Box old = b, n;
-    if (!contract_once(w, t, b, &n)) return false;
-    b = (Box){fmaxf(b.x0, n.x0), fminf(b.x1, n.x1), fmaxf(b.y0, n.y0), fminf(b.y1, n.y1)};
-    if (b.x0 > b.x1 || b.y0 > b.y1) return false;
-    if (!memcmp(&old, &b, sizeof b)) break;
-  }
-  *out = b;
-  return true;
-}
-static int refine_boxes(Worker *w, const Tape *t, Box *out) {
-  Box leaves[MAX_BOXES_PER_TERM], base;
-  if (!refine(w, t, (Box){-1, 1, -1, 1}, BASE_REFINE_ROUNDS, &base) || area(base) <= 0) return 0;
-  leaves[0] = base;
-  int nl = 1;
-  for (int d = 0; d < 5; d++) {
-    Box next[MAX_BOXES_PER_TERM];
-    int nn = 0;
-    bool changed = false;
-    for (int i = 0; i < nl; i++) {
-      Box b = leaves[i];
-      float ba = area(b);
-      if (ba <= 0.006f || nn + 2 > MAX_BOXES_PER_TERM) {
-        next[nn++] = b;
-        continue;
-      }
-      float ua = 0;
-      Box kids[2], keep[2];
-      float dx = b.x1 - b.x0, dy = b.y1 - b.y0;
-      if (dx >= dy) {
-        float m = .5f * (b.x0 + b.x1);
-        kids[0] = (Box){b.x0, m, b.y0, b.y1};
-        kids[1] = (Box){m, b.x1, b.y0, b.y1};
-      } else {
-        float m = .5f * (b.y0 + b.y1);
-        kids[0] = (Box){b.x0, b.x1, b.y0, m};
-        kids[1] = (Box){b.x0, b.x1, m, b.y1};
-      }
-      int nk = 0;
-      for (int k = 0; k < 2; k++)
-        if (refine(w, t, kids[k], CHILD_REFINE_ROUNDS, &keep[nk]) && area(keep[nk]) > 0) ua += area(keep[nk++]);
-      if (nk && ua < 0.95f * ba) {
-        for (int k = 0; k < nk; k++) next[nn++] = keep[k];
-        changed = true;
-      } else next[nn++] = b;
-    }
-    memcpy(leaves, next, nn * sizeof(Box));
-    nl = nn;
-    if (!changed) break;
-  }
-  memcpy(out, leaves, nl * sizeof(Box));
-  return nl;
-}
-
 static inline PixelBox pbox(Box b) {
   return (PixelBox){clampi((int)ceilf((b.x0 + 1) * .5f * (IMAGE_W - 1)), 0, IMAGE_W), clampi((int)floorf((b.x1 + 1) * .5f * (IMAGE_W - 1)), -1, IMAGE_W - 1),
                     clampi((int)ceilf((b.y0 + 1) * .5f * (IMAGE_H - 1)), 0, IMAGE_H), clampi((int)floorf((b.y1 + 1) * .5f * (IMAGE_H - 1)), -1, IMAGE_H - 1)};
@@ -534,13 +534,12 @@ static void eval_box(Worker *w, const Tape *t, Box b) {
 }
 
 static void render_terms(Worker *w) {
-  Box boxes[MAX_BOXES_PER_TERM];
 #pragma omp for schedule(dynamic, 1) nowait
   for (int i = 0; i < nfrontier; i++) {
     Tape t;
     if (!build_tape(w, i, &t)) continue;
-    int nb = refine_boxes(w, &t, boxes);
-    for (int k = 0; k < nb; k++) eval_box(w, &t, boxes[k]);
+    Box b;
+    if (contract_once(w, &t, (Box){-1, 1, -1, 1}, &b) && area(b) > 0) eval_box(w, &t, b);
   }
 }
 void vm_render_frame(Worker *w) {
