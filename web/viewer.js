@@ -46,7 +46,6 @@
     resetButton.disabled = !enabled;
     for (const elements of paramElements.values()) {
       elements.range.disabled = !enabled;
-      elements.number.disabled = !enabled;
     }
   }
 
@@ -73,10 +72,10 @@
   function syncParamControl(key) {
     const elements = paramElements.get(key);
     if (!elements) return;
-    const { spec, range, number } = elements;
+    const { spec, range, label } = elements;
     const value = paramsState[key];
     range.value = String(value);
-    number.value = formatParam(spec, value);
+    label.textContent = `${spec.label}: ${formatParam(spec, value)}`;
   }
 
   function syncAllParamControls() {
@@ -119,22 +118,11 @@
       range.max = String(spec.max);
       range.step = String(spec.step);
 
-      const number = document.createElement("input");
-      number.type = "number";
-      number.min = String(spec.min);
-      number.max = String(spec.max);
-      number.step = String(spec.step);
-      number.inputMode = "decimal";
-
-      row.append(name, range, number);
+      row.append(name, range);
       paramsControls.append(row);
-      paramElements.set(spec.key, { spec, range, number });
+      paramElements.set(spec.key, { spec, range, label: name });
 
       range.addEventListener("input", () => setParam(spec.key, range.value));
-      number.addEventListener("change", () => setParam(spec.key, number.value));
-      number.addEventListener("keydown", event => {
-        if (event.key === "Enter") number.blur();
-      });
     }
     syncAllParamControls();
     setControlsEnabled(ready);

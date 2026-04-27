@@ -72,26 +72,6 @@ input {
   border-left: 1px solid var(--line);
 }
 
-.title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.title-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-h1 {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 650;
-  letter-spacing: 0;
-}
-
 .state {
   min-width: 74px;
   min-height: 28px;
@@ -111,13 +91,6 @@ h1 {
 
 .state.error {
   color: #ff9f8c;
-}
-
-.field-label {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 650;
-  text-transform: uppercase;
 }
 
 #text-input {
@@ -190,13 +163,21 @@ h2 {
   gap: 6px 8px;
 }
 
+.layout-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 3px;
+}
+
 .param-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 42px;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  gap: 2px 4px;
+  gap: 2px;
   min-width: 0;
-  min-height: 30px;
+  min-height: 28px;
 }
 
 .param-label {
@@ -209,33 +190,11 @@ h2 {
 }
 
 .param-row input[type="range"] {
-  grid-column: 1 / -1;
-  grid-row: 2;
   min-width: 0;
   width: 100%;
   height: 12px;
   margin: 0;
   accent-color: var(--accent);
-}
-
-.param-row input[type="number"] {
-  grid-column: 2;
-  grid-row: 1;
-  justify-self: end;
-  width: 42px;
-  min-width: 0;
-  padding: 1px 3px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  outline: none;
-  background: #15181b;
-  color: var(--text);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.param-row input[type="number"]:focus {
-  border-color: var(--accent);
 }
 
 .param-row input:disabled {
