@@ -202,30 +202,33 @@ h2 {
 }
 
 .stats {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+  margin: 1px 0 0;
+  overflow-x: auto;
 }
 
 .stats div {
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #171a1e;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: max-content;
 }
 
 .stats dt {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 650;
   text-transform: uppercase;
 }
 
 .stats dd {
-  margin: 5px 0 0;
+  margin: 0;
   font-variant-numeric: tabular-nums;
-  font-size: 15px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 @media (max-width: 900px) {
