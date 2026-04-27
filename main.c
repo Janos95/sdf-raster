@@ -2,12 +2,30 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 
 static inline double now_sec(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void write_ppm(const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    perror("fopen");
+    exit(1);
+  }
+  fprintf(f, "P6\n%d %d\n255\n", IMAGE_W, IMAGE_H);
+  const uint8_t *image = vm_image_data();
+  for (int i = 0; i < IMAGE_W * IMAGE_H; i++) {
+    uint8_t v = image[i];
+    fputc(v, f);
+    fputc(v, f);
+    fputc(v, f);
+  }
+  fclose(f);
 }
 
 int main(int argc, char **argv) {
@@ -36,5 +54,6 @@ int main(int argc, char **argv) {
   mean /= BENCH_RUNS;
   printf("instructions=%d frontier_terms=%d image=%dx%d checksum=%d\n", vm_instruction_count(), vm_frontier_count(), IMAGE_W, IMAGE_H, vm_checksum());
   printf("mean_ms=%.3f std_ms=%.3f min_ms=%.3f max_ms=%.3f\n", mean, sqrt(fmax(0, ss / BENCH_RUNS - mean * mean)), mn, mx);
+  if (argc > 2) write_ppm(argv[2]);
   return 0;
 }

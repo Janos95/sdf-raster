@@ -87,7 +87,7 @@ static int idof(const char *s) {
     if (!strcmp(ids[i].key, s)) return ids[i].idx;
   return -1;
 }
-static inline void parse_arg(const char *s, int16_t *ref, float *value) {
+static inline void parse_arg(const char *s, int32_t *ref, float *value) {
   if (s[0] == '_') *ref = idof(s);
   else *value = strtof(s, NULL);
 }
@@ -173,14 +173,15 @@ int vm_load_file(const char *path) {
   fclose(f);
   return 0;
 }
-static void extract_frontier(void) {
+static void extract_frontier(int root) {
   nfrontier = 0;
+  if (root < 0 || root >= nins) return;
   if (++frontier_gen == 0) {
     memset(frontier_mark, 0, sizeof(frontier_mark));
     frontier_gen = 1;
   }
   int st[MAX_INS], sp = 0;
-  st[sp++] = nins - 1;
+  st[sp++] = root;
   while (sp) {
     int v = st[--sp];
     if (frontier_mark[v] == frontier_gen) continue;
@@ -605,12 +606,13 @@ static void render_terms(Worker *w) {
     if (contract_once(w, &t, (Box){-1, 1, -1, 1}, &b) && area(b) > 0) eval_box(w, &t, b);
   }
 }
-void vm_render_frame(Worker *w) {
+void vm_render_root_frame(Worker *w, int root) {
 #pragma omp single nowait
-  extract_frontier();
+  extract_frontier(root);
 #pragma omp for schedule(static) nowait
   for (int y = 0; y < IMAGE_H; y++) memset(&image[y * IMAGE_W], 0, IMAGE_W);
 #pragma omp barrier
   render_terms(w);
 #pragma omp barrier
 }
+void vm_render_frame(Worker *w) { vm_render_root_frame(w, nins - 1); }
