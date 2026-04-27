@@ -25,6 +25,7 @@ LETTERS_SHEET ?= $(GLYPH_DIR)/letters_sheet.ppm
 UNIQUE_LETTERS_SHEET ?= $(GLYPH_DIR)/letters_unique_sheet.ppm
 GENERATED_VM ?= $(GLYPH_DIR)/generated_prospero.vm
 GENERATED_JSON ?= $(GLYPH_DIR)/generated_prospero.json
+GLYPH_TABLE ?= $(GLYPH_DIR)/glyph_table.txt
 
 EMSDK ?= $(abspath ../emsdk)
 LLVM_OPENMP_SRC ?= $(abspath ../llvm-project-openmp)
@@ -71,7 +72,7 @@ run: $(TARGET)
 	env $(RUN_ENV) ./$(TARGET) $(VM)
 
 run-viewer: $(VIEWER)
-	env $(RUN_ENV) ./$(VIEWER) $(VM)
+	env $(RUN_ENV) ./$(VIEWER) --source-vm $(VM) --glyphs $(GLYPH_TABLE)
 
 run-wasm-omp: $(WASM_NODE_TARGET)
 	env OMP_NUM_THREADS=8 node $(WASM_NODE_TARGET) $(VM)
@@ -85,7 +86,7 @@ extract: $(EXTRACT_TARGET)
 
 typeset-expression:
 	mkdir -p $(GLYPH_DIR)
-	python3 $(GLYPH_DIR)/typeset_expression_vm.py --source-vm $(VM) --letters $(LETTERS_JSON) --out $(GENERATED_VM) --metadata $(GENERATED_JSON)
+	python3 $(GLYPH_DIR)/typeset_expression_vm.py --letters $(LETTERS_JSON) --out $(GENERATED_VM) --metadata $(GENERATED_JSON) --glyph-table $(GLYPH_TABLE)
 
 verify:
 	python3 $(GLYPH_DIR)/verify_prospero.py

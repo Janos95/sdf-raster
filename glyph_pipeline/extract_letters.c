@@ -362,6 +362,32 @@ static void mark_deps(int root, uint8_t *mark) {
   mark_deps(source_ins[root].b, mark);
 }
 
+static int mark_glyph_program_deps(uint8_t *mark, const uint8_t *letter_terms, int letter_count, const TermInfo *terms, int term_count) {
+  memset(mark, 0, (size_t)MAX_INS);
+  for (int letter = 0; letter < letter_count; letter++)
+    for (int term = 0; term < term_count; term++)
+      if (letter_terms[(size_t)letter * term_count + term]) mark_deps(terms[term].root, mark);
+  int count = 0;
+  for (int i = 0; i < source_count; i++)
+    if (mark[i]) count++;
+  return count;
+}
+
+static void write_glyph_program_json(FILE *out, const uint8_t *mark, int instruction_count) {
+  fprintf(out, "  \"glyph_program\": {\n");
+  fputs("    \"format\": \"vm-lines\",\n", out);
+  fprintf(out, "    \"instruction_count\": %d,\n", instruction_count);
+  fputs("    \"instructions\": [\n", out);
+  int written = 0;
+  for (int i = 0; i < source_count; i++) {
+    if (!mark[i]) continue;
+    fputs("      ", out);
+    json_string(out, source_text[i]);
+    fputs(++written == instruction_count ? "\n" : ",\n", out);
+  }
+  fputs("    ]\n  },\n", out);
+}
+
 static void ensure_dir(const char *dir) {
   if (!dir) return;
   if (mkdir(dir, 0775) == 0 || errno == EEXIST) return;
@@ -631,26 +657,50 @@ static bool same_letter_bitmap(const uint8_t *full_image, PixelBBox a, PixelBBox
 }
 
 static bool assign_ascii_labels(const LetterInfo *letters, int letter_count, int row_count, char *letter_char) {
-  static const char quote[] =
-      "This rough magic I here abjure, and, when I have required Some heavenly music, which even now I do, "
-      "To work mine end upon their senses that This airy charm is for, I'll break my staff, Bury it certain "
-      "fathoms in the earth, And deeper than did ever plummet sound I'll drown my book.";
-  char compact[MAX_INS];
-  int n = 0;
-  for (const char *p = quote; *p; p++)
-    if (*p != ' ') compact[n++] = *p;
-  int offset = n == letter_count + 1 && compact[0] == 'T' ? 1 : 0;
-  if (n - offset != letter_count) {
+  /*
+   * Labels are written in the visual top-to-bottom order, after vertically
+   * flipping the source render. Three source characters are not standalone
+   * connected components: the comma in "do," and the two y descenders in
+   * "my" / "bury" are attached to glyphs on adjacent rows.
+   */
+  static const char *component_rows[] = {
+      "ButthisroughmagicI",
+      "hereabjure,andwhen",
+      "IhaverequiredSome",
+      "heavenlymusic,whicheven",
+      "nowIdoToworkmine",
+      "endupontheirsensesthat",
+      "Thisairycharmisfor,I'll",
+      "breakmstaff,burit",
+      "certainfathomsinthe",
+      "earth,Anddeeperthandid",
+      "everplummetsound",
+      "I'lldrownmybook.",
+  };
+  int expected_rows = (int)(sizeof component_rows / sizeof component_rows[0]);
+  if (row_count != expected_rows) {
     memset(letter_char, 0, (size_t)letter_count);
     return false;
   }
 
-  int row_len[MAX_INS] = {0};
-  for (int i = 0; i < letter_count; i++) row_len[letters[i].row]++;
-  int pos = offset;
-  for (int row = row_count - 1; row >= 0; row--) {
+  int total = 0;
+  for (int visual_row = 0; visual_row < expected_rows; visual_row++) {
+    int source_row = row_count - 1 - visual_row;
+    int row_len = 0;
     for (int i = 0; i < letter_count; i++)
-      if (letters[i].row == row) letter_char[i] = compact[pos++];
+      if (letters[i].row == source_row) row_len++;
+    if (row_len != (int)strlen(component_rows[visual_row])) {
+      memset(letter_char, 0, (size_t)letter_count);
+      return false;
+    }
+    int pos = 0;
+    for (int i = 0; i < letter_count; i++)
+      if (letters[i].row == source_row) letter_char[i] = component_rows[visual_row][pos++];
+    total += row_len;
+  }
+  if (total != letter_count) {
+    memset(letter_char, 0, (size_t)letter_count);
+    return false;
   }
   return true;
 }
@@ -767,6 +817,8 @@ static void write_json(FILE *out, const char *source_path, const char *vm_dir, c
     for (int i = 0; i < unique_count; i++) unique_letters[i] = (SheetItem){letters[class_rep[i]], class_ascii[i]};
     write_contact_sheet_items(unique_sheet_path, full_image, unique_letters, unique_count, has_labels);
   }
+  uint8_t glyph_program_mark[MAX_INS];
+  int glyph_instruction_count = mark_glyph_program_deps(glyph_program_mark, letter_terms, letter_count, terms, term_count);
 
   fprintf(out, "{\n");
   fputs("  \"source\": ", out);
@@ -779,6 +831,7 @@ static void write_json(FILE *out, const char *source_path, const char *vm_dir, c
   fprintf(out, "    \"render\": {\"x\": [-1.0, 1.0], \"y\": [-1.0, 1.0], \"image_px\": [%d, %d]},\n", IMAGE_W, IMAGE_H);
   fprintf(out, "    \"layout\": {\"x_scale_from_render\": %.9g, \"y_scale_from_render\": %.9g, \"x\": \"render_x * x_scale_from_render\", \"y\": \"render_y * y_scale_from_render\"}\n", sx, sy);
   fprintf(out, "  },\n");
+  write_glyph_program_json(out, glyph_program_mark, glyph_instruction_count);
   if (vm_dir) {
     fputs("  \"standalone_letter_vm_dir\": ", out);
     json_string(out, vm_dir);

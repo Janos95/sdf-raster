@@ -34,6 +34,21 @@ EXPECTED_WORDS = [
     "book",
 ]
 
+EXPECTED_COMPONENT_ROWS = [
+    "ButthisroughmagicI",
+    "hereabjure,andwhen",
+    "IhaverequiredSome",
+    "heavenlymusic,whicheven",
+    "nowIdoToworkmine",
+    "endupontheirsensesthat",
+    "Thisairycharmisfor,I'll",
+    "breakmstaff,burit",
+    "certainfathomsinthe",
+    "earth,Anddeeperthandid",
+    "everplummetsound",
+    "I'lldrownmybook.",
+]
+
 
 def fail(message):
     print(f"FAIL: {message}")
@@ -77,6 +92,8 @@ def check_metadata():
         fail("metadata text does not start with 'But this rough magic'")
     if "and, when" in meta["text"]:
         fail("unexpected comma present in 'and when'")
+    if "source_vm" in meta:
+        fail("generated metadata still depends on an external source VM")
     if "Bury" in meta["text"]:
         fail("unexpected capitalization present in 'bury'")
     for word in EXPECTED_WORDS:
@@ -100,6 +117,17 @@ def check_extraction():
         fail("unexpected unique visual-unit count")
     if not data["ascii_labels"]:
         fail("ASCII labels were not assigned")
+    rows = {}
+    for letter in data["letters"]:
+        rows.setdefault(letter["row"], []).append(letter)
+    rendered_rows = []
+    for row in sorted(rows, reverse=True):
+        rendered_rows.append("".join(letter["char"] for letter in sorted(rows[row], key=lambda item: item["bbox_px"][0])))
+    if rendered_rows != EXPECTED_COMPONENT_ROWS:
+        fail("extracted component labels do not match the corrected source text rows")
+    program = data.get("glyph_program", {})
+    if program.get("format") != "vm-lines" or not program.get("instructions"):
+        fail("letters.json does not contain an embedded glyph_program")
     if not os.path.exists(UNIQUE_SHEET):
         fail("letters_unique_sheet.png is missing")
 

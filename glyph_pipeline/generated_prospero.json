@@ -1,7 +1,8 @@
 {
   "pipeline": "expression-subgraph",
-  "source_vm": "prospero.vm",
   "letters": "glyph_pipeline/letters.json",
+  "glyph_program_source": "prospero.vm",
+  "glyph_program_instructions": 6936,
   "text": "But this rough magic I here abjure, and when I have required Some heavenly music, which even now I do, To work mine end upon their senses that This airy charm is for, I'll break my staff, bury it certain fathoms in the earth, And deeper than did ever plummet sound I'll drown my book.",
   "scale": 0.76,
   "flip_y": true,

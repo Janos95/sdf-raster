@@ -1,1 +1,5 @@
 output.ppm
+__pycache__/
+*.pyc
+viewer
+vm_omp_tuned
