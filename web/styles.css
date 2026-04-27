@@ -79,6 +79,12 @@ input {
   gap: 12px;
 }
 
+.title-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 h1 {
   margin: 0;
   font-size: 20px;
@@ -88,6 +94,7 @@ h1 {
 
 .state {
   min-width: 74px;
+  min-height: 28px;
   padding: 5px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -130,10 +137,6 @@ h1 {
   border-color: var(--accent);
 }
 
-.button-row {
-  display: grid;
-}
-
 button {
   min-height: 40px;
   border: 1px solid var(--line);
@@ -150,6 +153,14 @@ button:hover {
 button:disabled {
   color: #757c85;
   cursor: not-allowed;
+}
+
+#reset-button {
+  min-width: 74px;
+  min-height: 28px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .layout-controls {
