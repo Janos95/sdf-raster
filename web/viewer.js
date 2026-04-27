@@ -21,7 +21,7 @@
   ];
   const PARAM_BY_KEY = new Map(PARAM_SPECS.map(spec => [spec.key, spec]));
   const TEXT_RENDER_DELAY = 70;
-  const PARAM_RENDER_DELAY = 16;
+  const PARAM_RENDER_DELAY = 0;
 
   let worker;
   let imageData;
