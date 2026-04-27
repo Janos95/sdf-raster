@@ -1,14 +1,14 @@
 :root {
   color-scheme: dark;
-  --bg: #111315;
-  --panel: #1d2024;
-  --panel-strong: #262a30;
-  --text: #eceff2;
-  --muted: #a9b0b8;
-  --line: #383e46;
-  --accent: #61b37b;
-  --accent-strong: #89d59f;
-  --warn: #d9b45f;
+  --bg: #171718;
+  --panel: #222326;
+  --panel-strong: #2c2e34;
+  --text: #f2f0ec;
+  --muted: #b7b2aa;
+  --line: #47484d;
+  --accent: #91a7ff;
+  --accent-strong: #c5ceff;
+  --warn: #d7ad65;
 }
 
 * {
@@ -46,7 +46,7 @@ input {
   min-width: 0;
   min-height: 0;
   padding: 18px;
-  background: #0f1011;
+  background: #111112;
 }
 
 #viewport {
@@ -57,7 +57,7 @@ input {
   aspect-ratio: 1;
   background: #000;
   image-rendering: pixelated;
-  border: 1px solid #2a2d31;
+  border: 1px solid #34353a;
 }
 
 .control-pane {
@@ -90,7 +90,7 @@ input {
 }
 
 .state.error {
-  color: #ff9f8c;
+  color: #ff9a8a;
 }
 
 #text-input {
@@ -101,7 +101,7 @@ input {
   border: 1px solid var(--line);
   border-radius: 6px;
   outline: none;
-  background: #15181b;
+  background: #191a1d;
   color: var(--text);
   line-height: 1.45;
 }
@@ -124,7 +124,7 @@ button:hover {
 }
 
 button:disabled {
-  color: #757c85;
+  color: #7b7e86;
   cursor: not-allowed;
 }
 
@@ -198,7 +198,7 @@ h2 {
 }
 
 .param-row input:disabled {
-  color: #757c85;
+  color: #7b7e86;
 }
 
 .stats {
