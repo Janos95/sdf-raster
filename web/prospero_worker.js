@@ -4,6 +4,8 @@ let initializing;
 let heap;
 let threaded = false;
 
+const PARAM_KEYS = ["scale", "marginX", "marginY", "maxWidth", "tracking", "spaceWidth", "lineGap"];
+
 function moduleUrl(path) {
   return new URL(`../build-wasm-web/${path}`, self.location.href).href;
 }
@@ -14,6 +16,18 @@ function wrapApi() {
     defaultText: Module.cwrap("prospero_default_text", "number", []),
     text: Module.cwrap("prospero_text", "number", []),
     setText: Module.cwrap("prospero_set_text", "number", ["string"]),
+    setTypesetParams: Module.cwrap("prospero_set_typeset_params", "number", [
+      "number",
+      "number",
+      "number",
+      "number",
+      "number",
+      "number",
+      "number"
+    ]),
+    resetTypesetParams: Module.cwrap("prospero_reset_typeset_params", "number", []),
+    typesetParam: Module.cwrap("prospero_typeset_param", "number", ["number"]),
+    defaultTypesetParam: Module.cwrap("prospero_default_typeset_param", "number", ["number"]),
     render: Module.cwrap("prospero_render", "number", []),
     imageData: Module.cwrap("prospero_image_data", "number", []),
     width: Module.cwrap("prospero_image_width", "number", []),
@@ -22,6 +36,21 @@ function wrapApi() {
     textLen: Module.cwrap("prospero_text_len", "number", []),
     maxThreads: Module.cwrap("prospero_max_threads", "number", [])
   };
+}
+
+function readParams(getter) {
+  const params = {};
+  for (let i = 0; i < PARAM_KEYS.length; i++) params[PARAM_KEYS[i]] = getter(i);
+  return params;
+}
+
+function applyParams(params) {
+  if (!params) return;
+  const values = PARAM_KEYS.map((key, index) => {
+    const value = Number(params[key]);
+    return Number.isFinite(value) ? value : api.defaultTypesetParam(index);
+  });
+  if (api.setTypesetParams(...values) !== 0) throw new Error("layout parameter update failed");
 }
 
 function moduleConfig() {
@@ -48,6 +77,7 @@ function makeFrame(seq = 0) {
     renderUs,
     pixels: pixels.buffer,
     text: Module.UTF8ToString(api.text()),
+    params: readParams(api.typesetParam),
     threads: api.maxThreads(),
     instructions: api.instructionCount(),
     textLen: api.textLen()
@@ -93,13 +123,20 @@ self.onmessage = event => {
       self.postMessage({ type: "status", label: "Render" });
       const frame = makeFrame(0);
       self.postMessage(
-        { type: "ready", defaultText: Module.UTF8ToString(api.defaultText()), frame },
+        {
+          type: "ready",
+          defaultText: Module.UTF8ToString(api.defaultText()),
+          defaultParams: readParams(api.defaultTypesetParam),
+          params: readParams(api.typesetParam),
+          frame
+        },
         [frame.pixels]
       );
       return;
     }
     if (message.type === "render") {
       await initModule();
+      applyParams(message.params);
       if (api.setText(message.text) !== 0) throw new Error("text build failed");
       const frame = makeFrame(message.seq);
       self.postMessage(frame, [frame.pixels]);

@@ -4,11 +4,24 @@
   const textarea = document.getElementById("text-input");
   const renderButton = document.getElementById("render-button");
   const resetButton = document.getElementById("reset-button");
+  const resetLayoutButton = document.getElementById("reset-layout-button");
+  const paramsControls = document.getElementById("params-controls");
   const state = document.getElementById("state");
   const renderMs = document.getElementById("render-ms");
   const threads = document.getElementById("threads");
   const instructions = document.getElementById("instructions");
   const textLen = document.getElementById("text-len");
+
+  const PARAM_SPECS = [
+    { key: "scale", label: "Scale", min: 0.1, max: 2, step: 0.01, precision: 2 },
+    { key: "marginX", label: "Margin X", min: 0, max: 1024, step: 1, precision: 0 },
+    { key: "marginY", label: "Margin Y", min: 0, max: 1024, step: 1, precision: 0 },
+    { key: "maxWidth", label: "Max Width", min: 1, max: 1024, step: 1, precision: 0 },
+    { key: "tracking", label: "Tracking", min: -10, max: 40, step: 0.5, precision: 1 },
+    { key: "spaceWidth", label: "Space", min: 0, max: 100, step: 1, precision: 0 },
+    { key: "lineGap", label: "Line Gap", min: -20, max: 80, step: 1, precision: 0 }
+  ];
+  const PARAM_BY_KEY = new Map(PARAM_SPECS.map(spec => [spec.key, spec]));
 
   let worker;
   let imageData;
@@ -18,6 +31,9 @@
   let latestSeq = 0;
   let ready = false;
   let rendering = false;
+  let paramsState = {};
+  let defaultParams = {};
+  const paramElements = new Map();
 
   function setState(label, kind = "") {
     state.textContent = label;
@@ -28,6 +44,101 @@
     textarea.disabled = !enabled;
     renderButton.disabled = !enabled || rendering;
     resetButton.disabled = !enabled;
+    resetLayoutButton.disabled = !enabled;
+    for (const elements of paramElements.values()) {
+      elements.range.disabled = !enabled;
+      elements.number.disabled = !enabled;
+    }
+  }
+
+  function clampParam(spec, value, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(spec.max, Math.max(spec.min, parsed));
+  }
+
+  function formatParam(spec, value) {
+    const fixed = Number(value).toFixed(spec.precision);
+    return spec.precision === 0 ? String(Math.round(Number(fixed))) : fixed;
+  }
+
+  function currentParams() {
+    const params = {};
+    for (const spec of PARAM_SPECS) {
+      const fallback = defaultParams[spec.key] ?? spec.min;
+      params[spec.key] = clampParam(spec, paramsState[spec.key], fallback);
+    }
+    return params;
+  }
+
+  function syncParamControl(key) {
+    const elements = paramElements.get(key);
+    if (!elements) return;
+    const { spec, range, number } = elements;
+    const value = paramsState[key];
+    range.value = String(value);
+    number.value = formatParam(spec, value);
+  }
+
+  function syncAllParamControls() {
+    for (const spec of PARAM_SPECS) syncParamControl(spec.key);
+  }
+
+  function setParam(key, value) {
+    const spec = PARAM_BY_KEY.get(key);
+    if (!spec) return;
+    const fallback = paramsState[key] ?? defaultParams[key] ?? spec.min;
+    paramsState[key] = clampParam(spec, value, fallback);
+    syncParamControl(key);
+    requestRender(false);
+  }
+
+  function setParams(params) {
+    const next = {};
+    for (const spec of PARAM_SPECS) {
+      const fallback = defaultParams[spec.key] ?? spec.min;
+      next[spec.key] = clampParam(spec, params?.[spec.key], fallback);
+    }
+    paramsState = next;
+    syncAllParamControls();
+  }
+
+  function buildParamControls() {
+    paramsControls.textContent = "";
+    paramElements.clear();
+    for (const spec of PARAM_SPECS) {
+      const row = document.createElement("label");
+      row.className = "param-row";
+
+      const name = document.createElement("span");
+      name.className = "param-label";
+      name.textContent = spec.label;
+
+      const range = document.createElement("input");
+      range.type = "range";
+      range.min = String(spec.min);
+      range.max = String(spec.max);
+      range.step = String(spec.step);
+
+      const number = document.createElement("input");
+      number.type = "number";
+      number.min = String(spec.min);
+      number.max = String(spec.max);
+      number.step = String(spec.step);
+      number.inputMode = "decimal";
+
+      row.append(name, range, number);
+      paramsControls.append(row);
+      paramElements.set(spec.key, { spec, range, number });
+
+      range.addEventListener("input", () => setParam(spec.key, range.value));
+      number.addEventListener("change", () => setParam(spec.key, number.value));
+      number.addEventListener("keydown", event => {
+        if (event.key === "Enter") number.blur();
+      });
+    }
+    syncAllParamControls();
+    setControlsEnabled(ready);
   }
 
   function paintGray(width, height, buffer) {
@@ -64,7 +175,12 @@
       setControlsEnabled(true);
       setState("Render", "busy");
       latestSeq = nextSeq++;
-      worker.postMessage({ type: "render", seq: latestSeq, text: textarea.value });
+      worker.postMessage({
+        type: "render",
+        seq: latestSeq,
+        text: textarea.value,
+        params: currentParams()
+      });
     }, delay);
   }
 
@@ -76,6 +192,7 @@
       const nextCursor = Math.min(cursor, frame.text.length);
       textarea.setSelectionRange(nextCursor, nextCursor);
     }
+    if (frame.params) setParams(frame.params);
     paintGray(frame.width, frame.height, frame.pixels);
     updateStats(frame);
     rendering = false;
@@ -91,6 +208,9 @@
       if (message.type === "ready") {
         ready = true;
         defaultText = message.defaultText;
+        defaultParams = message.defaultParams || {};
+        setParams(message.params || defaultParams);
+        buildParamControls();
         textarea.value = defaultText;
         handleFrame(message.frame);
         return;
@@ -118,8 +238,8 @@
       setControlsEnabled(false);
       setState("Error", "error");
     };
-    const params = new URLSearchParams(window.location.search);
-    const forceFallback = params.has("fallback") || params.get("threaded") === "0";
+    const queryParams = new URLSearchParams(window.location.search);
+    const forceFallback = queryParams.has("fallback") || queryParams.get("threaded") === "0";
     worker.postMessage({ type: "init", threaded: window.crossOriginIsolated && !forceFallback });
     textarea.addEventListener("input", () => requestRender(false));
     renderButton.addEventListener("click", () => requestRender(true));
@@ -127,6 +247,10 @@
       textarea.value = defaultText;
       requestRender(true);
       textarea.focus();
+    });
+    resetLayoutButton.addEventListener("click", () => {
+      setParams(defaultParams);
+      requestRender(true);
     });
     canvas.addEventListener("click", () => textarea.focus());
   }

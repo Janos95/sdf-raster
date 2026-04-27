@@ -44,7 +44,7 @@ WASM_STACK_SIZE ?= 8388608
 EMSDK_ENV = export EMSDK_QUIET=1 && . $(EMSDK)/emsdk_env.sh >/dev/null
 WASM_CFLAGS := -O3 -flto -DNDEBUG -ffast-math -ffp-contract=fast -fopenmp -pthread -msimd128
 WASM_FALLBACK_CFLAGS := -O3 -flto -DNDEBUG -ffast-math -ffp-contract=fast -msimd128
-WASM_WEB_EXPORTS := ["_prospero_init","_prospero_default_text","_prospero_text","_prospero_set_text","_prospero_append_text","_prospero_append_newline","_prospero_backspace","_prospero_render","_prospero_image_data","_prospero_image_width","_prospero_image_height","_prospero_instruction_count","_prospero_root","_prospero_text_len","_prospero_max_threads","_prospero_last_render_ms"]
+WASM_WEB_EXPORTS := ["_prospero_init","_prospero_default_text","_prospero_text","_prospero_set_text","_prospero_set_typeset_params","_prospero_reset_typeset_params","_prospero_typeset_param","_prospero_default_typeset_param","_prospero_append_text","_prospero_append_newline","_prospero_backspace","_prospero_render","_prospero_image_data","_prospero_image_width","_prospero_image_height","_prospero_instruction_count","_prospero_root","_prospero_text_len","_prospero_max_threads","_prospero_last_render_ms"]
 WASM_WEB_RUNTIME := ["ccall","cwrap","UTF8ToString","HEAPU8"]
 WASM_LDFLAGS := \
 	-sPTHREAD_POOL_SIZE=8 \

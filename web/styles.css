@@ -29,7 +29,8 @@ body {
 }
 
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
@@ -63,7 +64,9 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  height: 100vh;
   min-width: 0;
+  overflow-y: auto;
   padding: 18px;
   background: var(--panel);
   border-left: 1px solid var(--line);
@@ -112,7 +115,7 @@ h1 {
 
 #text-input {
   flex: 1;
-  min-height: 320px;
+  min-height: 220px;
   resize: none;
   padding: 12px;
   border: 1px solid var(--line);
@@ -149,6 +152,83 @@ button:hover {
 button:disabled {
   color: #757c85;
   cursor: not-allowed;
+}
+
+.layout-controls {
+  display: grid;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.layout-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+h2 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+#reset-layout-button {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.params-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.param-row {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr) 76px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.param-label {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.param-row input[type="range"] {
+  min-width: 0;
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.param-row input[type="number"] {
+  width: 76px;
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  outline: none;
+  background: #15181b;
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.param-row input[type="number"]:focus {
+  border-color: var(--accent);
+}
+
+.param-row input:disabled {
+  color: #757c85;
 }
 
 .stats {
@@ -197,7 +277,18 @@ button:disabled {
   }
 
   .control-pane {
+    height: auto;
     border-left: 0;
     border-top: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 480px) {
+  .param-row {
+    grid-template-columns: minmax(0, 1fr) 76px;
+  }
+
+  .param-label {
+    grid-column: 1 / -1;
   }
 }

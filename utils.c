@@ -19,6 +19,16 @@ const char *DEFAULT_VIEWER_TEXT =
     "I'll break my staff, bury it certain fathoms in the earth, And deeper than did ever "
     "plummet sound I'll drown my book.";
 
+const TypesetParams DEFAULT_TYPESET_PARAMS = {
+    .scale = 0.76f,
+    .margin_x = 36.0f,
+    .margin_y = 54.0f,
+    .max_width = 955.0f,
+    .tracking = 4.0f,
+    .space_width = 18.0f,
+    .line_gap = 9.0f,
+};
+
 static int parse_op(const char *s) {
   static const char *name[] = {"const", "var-x", "var-y", "add", "sub", "mul", "neg", "square", "sqrt", "min", "max"};
   for (int i = 0; i < (int)(sizeof name / sizeof name[0]); i++)
@@ -297,42 +307,41 @@ static int emit_glyph(const TextProgram *tp, const Glyph *g, float x, float y, f
   return root;
 }
 
-int text_program_build(TextProgram *tp, const char *text) {
-  const float scale = 0.76f, margin_x = 36.0f, margin_y = 54.0f, max_width = 955.0f;
-  const float tracking = 4.0f, space_width = 18.0f, line_gap = 9.0f;
+int text_program_build(TextProgram *tp, const char *text, const TypesetParams *params) {
+  const TypesetParams *layout = params ? params : &DEFAULT_TYPESET_PARAMS;
   float max_ascent = 0, max_descent = 0;
   for (int ch = 0; ch < UTIL_MAX_GLYPHS; ch++) {
     if (!tp->glyph[ch].present) continue;
     float w, h, baseline;
-    glyph_metrics(&tp->glyph[ch], ch, scale, &w, &h, &baseline);
+    glyph_metrics(&tp->glyph[ch], ch, layout->scale, &w, &h, &baseline);
     if (baseline > max_ascent) max_ascent = baseline;
     if (h - baseline > max_descent) max_descent = h - baseline;
   }
-  float line_h = max_ascent + max_descent + line_gap;
+  float line_h = max_ascent + max_descent + layout->line_gap;
   vm_reset_program();
   emit_failed = 0;
   tp->out_x = emit_instr(OP_VARX, -1, -1, 0, 0);
   tp->out_y = emit_instr(OP_VARY, -1, -1, 0, 0);
-  float x = margin_x, y = margin_y;
+  float x = layout->margin_x, y = layout->margin_y;
   int root = -1;
-  const char *p = text;
-  while (*p) {
-    while (*p == ' ') p++;
-    if (*p == '\n') {
-      x = margin_x;
+  const char *cursor = text;
+  while (*cursor) {
+    while (*cursor == ' ') cursor++;
+    if (*cursor == '\n') {
+      x = layout->margin_x;
       y += line_h;
-      p++;
+      cursor++;
       continue;
     }
-    const char *word = p;
-    while (*p && *p != ' ' && *p != '\n') p++;
-    if (word == p) continue;
-    float word_w = text_width(word, p, tp->glyph, scale, tracking, space_width);
-    if (x > margin_x && x + word_w > margin_x + max_width) {
-      x = margin_x;
+    const char *word = cursor;
+    while (*cursor && *cursor != ' ' && *cursor != '\n') cursor++;
+    if (word == cursor) continue;
+    float word_w = text_width(word, cursor, tp->glyph, layout->scale, layout->tracking, layout->space_width);
+    if (x > layout->margin_x && x + word_w > layout->margin_x + layout->max_width) {
+      x = layout->margin_x;
       y += line_h;
     }
-    for (const char *q = word; q < p; q++) {
+    for (const char *q = word; q < cursor; q++) {
       unsigned char ch = (unsigned char)*q;
       Glyph *g = &tp->glyph[ch];
       if (!g->present) {
@@ -340,14 +349,14 @@ int text_program_build(TextProgram *tp, const char *text) {
         return -1;
       }
       float gw, gh, baseline;
-      glyph_metrics(g, ch, scale, &gw, &gh, &baseline);
+      glyph_metrics(g, ch, layout->scale, &gw, &gh, &baseline);
       float top = y + max_ascent - baseline;
       int term = emit_glyph(tp, g, x, top, gw, gh);
       if (term < 0) return -1;
       root = emit_union(root, term);
-      x += gw + tracking;
+      x += gw + layout->tracking;
     }
-    x += space_width;
+    x += layout->space_width;
   }
   if (root < 0) root = emit_const(1.0f);
   tp->root = root;

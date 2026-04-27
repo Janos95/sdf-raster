@@ -2,6 +2,7 @@
 
 #include <SDL2/SDL.h>
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,16 +49,46 @@ static int present_frame(SDL_Window *window, SDL_Renderer *renderer, SDL_Texture
   return 0;
 }
 
+static int parse_float_arg(const char *name, const char *value, float *out) {
+  char *end = NULL;
+  float parsed = strtof(value, &end);
+  if (!value[0] || (end && *end) || !isfinite(parsed)) {
+    fprintf(stderr, "invalid value for %s: %s\n", name, value);
+    return -1;
+  }
+  *out = parsed;
+  return 0;
+}
+
 static void usage(const char *argv0) {
-  fprintf(stderr, "usage: %s [--text TEXT] [--glyphs glyph_pipeline/glyph_table.txt]\n", argv0);
+  fprintf(stderr,
+          "usage: %s [--text TEXT] [--glyphs glyph_pipeline/glyph_table.txt] "
+          "[--scale N] [--margin-x N] [--margin-y N] [--max-width N] "
+          "[--tracking N] [--space-width N] [--line-gap N]\n",
+          argv0);
 }
 
 int main(int argc, char **argv) {
   const char *glyph_table = "glyph_pipeline/glyph_table.txt";
   const char *initial_text = DEFAULT_VIEWER_TEXT;
+  TypesetParams layout = DEFAULT_TYPESET_PARAMS;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--text") && i + 1 < argc) initial_text = argv[++i];
     else if (!strcmp(argv[i], "--glyphs") && i + 1 < argc) glyph_table = argv[++i];
+    else if (!strcmp(argv[i], "--scale") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.scale) == 0) i++;
+    else if (!strcmp(argv[i], "--margin-x") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.margin_x) == 0) i++;
+    else if (!strcmp(argv[i], "--margin-y") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.margin_y) == 0) i++;
+    else if (!strcmp(argv[i], "--max-width") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.max_width) == 0) i++;
+    else if (!strcmp(argv[i], "--tracking") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.tracking) == 0) i++;
+    else if (!strcmp(argv[i], "--space-width") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.space_width) == 0) i++;
+    else if (!strcmp(argv[i], "--line-gap") && i + 1 < argc &&
+             parse_float_arg(argv[i], argv[i + 1], &layout.line_gap) == 0) i++;
     else {
       usage(argv[0]);
       return 1;
@@ -71,7 +102,7 @@ int main(int argc, char **argv) {
   size_t text_len = strlen(text);
   vm_init_coords();
   if (text_program_load(&tp, glyph_table) != 0) return 1;
-  if (text_program_build(&tp, text) != 0) return 1;
+  if (text_program_build(&tp, text, &layout) != 0) return 1;
   fprintf(stderr, "viewer bytecode: instructions=%d root=%d\n", vm_instruction_count(), tp.root);
 
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -136,7 +167,7 @@ int main(int argc, char **argv) {
           else if (e.type == SDL_TEXTINPUT) changed |= append_text_input(&tp, text, &text_len, e.text.text);
         }
         if (changed) {
-          if (text_program_build(&tp, text) == 0) {
+          if (text_program_build(&tp, text, &layout) == 0) {
             needs_render = 1;
             avg_ready = 0;
             title_frames = 0;

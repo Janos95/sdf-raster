@@ -44,12 +44,23 @@ typedef struct {
   int out_x, out_y, root;
 } TextProgram;
 
+typedef struct {
+  float scale;
+  float margin_x;
+  float margin_y;
+  float max_width;
+  float tracking;
+  float space_width;
+  float line_gap;
+} TypesetParams;
+
 extern const char *DEFAULT_VIEWER_TEXT;
+extern const TypesetParams DEFAULT_TYPESET_PARAMS;
 
 int vm_load_file(const char *path);
 
 int text_program_load(TextProgram *tp, const char *glyph_table);
-int text_program_build(TextProgram *tp, const char *text);
+int text_program_build(TextProgram *tp, const char *text, const TypesetParams *params);
 int text_char_supported(const TextProgram *tp, unsigned char ch);
 unsigned char closest_supported_char(const TextProgram *tp, unsigned char ch);
 int append_text_char(char *text, size_t *len, unsigned char ch);
