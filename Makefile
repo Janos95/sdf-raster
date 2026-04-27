@@ -11,9 +11,9 @@ TARGET := vm_omp_tuned
 VIEWER := viewer
 EXTRACT_TARGET := extract_letters
 GLYPH_DIR ?= glyph_pipeline
-SRC := vm.c main.c
-VIEWER_SRC := vm.c viewer.c
-HDR := vm.h
+SRC := vm.c utils.c main.c
+VIEWER_SRC := vm.c utils.c viewer.c
+HDR := vm.h utils.h
 VM := prospero.vm
 PPM ?= output.ppm
 SDL2_PREFIX ?= /opt/homebrew/opt/sdl2
@@ -57,7 +57,7 @@ $(TARGET): $(SRC) $(HDR)
 $(VIEWER): $(VIEWER_SRC) $(HDR)
 	$(CC) $(CPPFLAGS) $(SDL_CPPFLAGS) $(CFLAGS) $(VIEWER_SRC) $(LDFLAGS) $(SDL_LDFLAGS) $(LDLIBS) $(SDL_LIBS) -o $@
 
-$(EXTRACT_TARGET): vm.c $(GLYPH_DIR)/extract_letters.c $(HDR)
+$(EXTRACT_TARGET): vm.c $(GLYPH_DIR)/extract_letters.c vm.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) vm.c $(GLYPH_DIR)/extract_letters.c $(LDFLAGS) $(LDLIBS) -o $@
 
 $(OPENMP_WASM_PREFIX)/lib/libomp.a:

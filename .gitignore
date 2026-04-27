@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 viewer
 vm_omp_tuned
+extract_letters

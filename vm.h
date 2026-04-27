@@ -30,7 +30,6 @@ typedef struct Worker {
 
 void vm_reset_program(void);
 void vm_init_coords(void);
-int vm_load_file(const char *path);
 int vm_add_instr(Instr in);
 int vm_instruction_count(void);
 int vm_frontier_count(void);
