@@ -7,9 +7,15 @@
     <link rel="stylesheet" href="styles.css">
     <script>
       (() => {
-        if (window.crossOriginIsolated || !("serviceWorker" in navigator)) return;
+        const reloadKey = "prospero-coi-reload";
+        if (window.crossOriginIsolated || !("serviceWorker" in navigator)) {
+          window.sessionStorage.removeItem(reloadKey);
+          return;
+        }
         navigator.serviceWorker.register("coi-serviceworker.js").then(() => {
-          if (!navigator.serviceWorker.controller) window.location.reload();
+          if (window.sessionStorage.getItem(reloadKey)) return;
+          window.sessionStorage.setItem(reloadKey, "1");
+          window.location.reload();
         }).catch(() => {});
       })();
     </script>

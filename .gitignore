@@ -5,4 +5,4 @@ viewer
 vm_omp_tuned
 extract_letters
 build-wasm-node/
-build-wasm-web/
+/build-wasm-web/

@@ -7,7 +7,7 @@ let threaded = false;
 const PARAM_KEYS = ["scale", "marginX", "marginY", "maxWidth", "tracking", "spaceWidth", "lineGap"];
 
 function moduleUrl(path) {
-  return new URL(`../build-wasm-web/${path}`, self.location.href).href;
+  return new URL(`build-wasm-web/${path}`, self.location.href).href;
 }
 
 function wrapApi() {

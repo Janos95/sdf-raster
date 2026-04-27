@@ -35,10 +35,10 @@ OPENMP_WASM_PREFIX ?= $(WASM_DEPS_ROOT)/openmp-wasm-install
 OPENMP_WASM_BUILD ?= $(WASM_DEPS_ROOT)/openmp-wasm-build
 WASM_NODE_DIR ?= build-wasm-node
 WASM_NODE_TARGET := $(WASM_NODE_DIR)/prospero.js
-WASM_WEB_DIR ?= build-wasm-web
+WEB_DIR ?= web
+WASM_WEB_DIR ?= $(WEB_DIR)/build-wasm-web
 WASM_WEB_TARGET := $(WASM_WEB_DIR)/prospero_web.js
 WASM_WEB_FALLBACK_TARGET := $(WASM_WEB_DIR)/prospero_web_fallback.js
-WEB_DIR ?= web
 PORT ?= 8000
 WASM_STACK_SIZE ?= 8388608
 EMSDK_ENV = export EMSDK_QUIET=1 && . $(EMSDK)/emsdk_env.sh >/dev/null
