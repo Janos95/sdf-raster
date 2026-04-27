@@ -28,7 +28,6 @@ jobs:
           mkdir -p site
           cp index.html site/
           cp -R web site/web
-          cp -R build-wasm-web site/build-wasm-web
           touch site/.nojekyll
       - uses: actions/upload-pages-artifact@v4
         with:
