@@ -48,7 +48,7 @@ extern const char *DEFAULT_VIEWER_TEXT;
 
 int vm_load_file(const char *path);
 
-int text_program_load(TextProgram *tp, const char *source_vm, const char *glyph_table);
+int text_program_load(TextProgram *tp, const char *glyph_table);
 int text_program_build(TextProgram *tp, const char *text);
 int text_char_supported(const TextProgram *tp, unsigned char ch);
 unsigned char closest_supported_char(const TextProgram *tp, unsigned char ch);

@@ -49,16 +49,14 @@ static int present_frame(SDL_Window *window, SDL_Renderer *renderer, SDL_Texture
 }
 
 static void usage(const char *argv0) {
-  fprintf(stderr, "usage: %s [--text TEXT] [--source-vm prospero.vm] [--glyphs glyph_pipeline/glyph_table.txt]\n", argv0);
+  fprintf(stderr, "usage: %s [--text TEXT] [--glyphs glyph_pipeline/glyph_table.txt]\n", argv0);
 }
 
 int main(int argc, char **argv) {
-  const char *source_vm = "prospero.vm";
   const char *glyph_table = "glyph_pipeline/glyph_table.txt";
   const char *initial_text = DEFAULT_VIEWER_TEXT;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--text") && i + 1 < argc) initial_text = argv[++i];
-    else if (!strcmp(argv[i], "--source-vm") && i + 1 < argc) source_vm = argv[++i];
     else if (!strcmp(argv[i], "--glyphs") && i + 1 < argc) glyph_table = argv[++i];
     else {
       usage(argv[0]);
@@ -72,7 +70,7 @@ int main(int argc, char **argv) {
   text[sizeof(text) - 1] = 0;
   size_t text_len = strlen(text);
   vm_init_coords();
-  if (text_program_load(&tp, source_vm, glyph_table) != 0) return 1;
+  if (text_program_load(&tp, glyph_table) != 0) return 1;
   if (text_program_build(&tp, text) != 0) return 1;
   fprintf(stderr, "viewer bytecode: instructions=%d root=%d\n", vm_instruction_count(), tp.root);
 

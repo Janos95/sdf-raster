@@ -4,3 +4,5 @@ __pycache__/
 viewer
 vm_omp_tuned
 extract_letters
+build-wasm-node/
+build-wasm-web/

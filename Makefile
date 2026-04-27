@@ -13,6 +13,7 @@ EXTRACT_TARGET := extract_letters
 GLYPH_DIR ?= glyph_pipeline
 SRC := vm.c utils.c main.c
 VIEWER_SRC := vm.c utils.c viewer.c
+WEB_SRC := vm.c utils.c web_viewer.c
 HDR := vm.h utils.h
 VM := prospero.vm
 PPM ?= output.ppm
@@ -27,15 +28,24 @@ GENERATED_VM ?= $(GLYPH_DIR)/generated_prospero.vm
 GENERATED_JSON ?= $(GLYPH_DIR)/generated_prospero.json
 GLYPH_TABLE ?= $(GLYPH_DIR)/glyph_table.txt
 
-EMSDK ?= $(abspath ../emsdk)
-LLVM_OPENMP_SRC ?= $(abspath ../llvm-project-openmp)
-OPENMP_WASM_PREFIX ?= $(abspath ../openmp-wasm-install)
-OPENMP_WASM_BUILD ?= $(abspath ../openmp-wasm-build)
+WASM_DEPS_ROOT ?= $(HOME)/Projects
+EMSDK ?= $(WASM_DEPS_ROOT)/emsdk
+LLVM_OPENMP_SRC ?= $(WASM_DEPS_ROOT)/llvm-project-openmp
+OPENMP_WASM_PREFIX ?= $(WASM_DEPS_ROOT)/openmp-wasm-install
+OPENMP_WASM_BUILD ?= $(WASM_DEPS_ROOT)/openmp-wasm-build
 WASM_NODE_DIR ?= build-wasm-node
 WASM_NODE_TARGET := $(WASM_NODE_DIR)/prospero.js
+WASM_WEB_DIR ?= build-wasm-web
+WASM_WEB_TARGET := $(WASM_WEB_DIR)/prospero_web.js
+WASM_WEB_FALLBACK_TARGET := $(WASM_WEB_DIR)/prospero_web_fallback.js
+WEB_DIR ?= web
+PORT ?= 8000
 WASM_STACK_SIZE ?= 8388608
 EMSDK_ENV = export EMSDK_QUIET=1 && . $(EMSDK)/emsdk_env.sh >/dev/null
 WASM_CFLAGS := -O3 -flto -DNDEBUG -ffast-math -ffp-contract=fast -fopenmp -pthread -msimd128
+WASM_FALLBACK_CFLAGS := -O3 -flto -DNDEBUG -ffast-math -ffp-contract=fast -msimd128
+WASM_WEB_EXPORTS := ["_prospero_init","_prospero_default_text","_prospero_text","_prospero_set_text","_prospero_append_text","_prospero_append_newline","_prospero_backspace","_prospero_render","_prospero_image_data","_prospero_image_width","_prospero_image_height","_prospero_instruction_count","_prospero_root","_prospero_text_len","_prospero_max_threads","_prospero_last_render_ms"]
+WASM_WEB_RUNTIME := ["ccall","cwrap","UTF8ToString","HEAPU8"]
 WASM_LDFLAGS := \
 	-sPTHREAD_POOL_SIZE=8 \
 	-sPROXY_TO_PTHREAD \
@@ -47,7 +57,7 @@ WASM_LDFLAGS := \
 
 RUN_ENV := OMP_NUM_THREADS=8 KMP_BLOCKTIME=infinite OMP_WAIT_POLICY=active OMP_PROC_BIND=close OMP_PLACES=threads
 
-.PHONY: all wasm-omp run run-viewer run-wasm-omp render extract typeset-expression verify clean
+.PHONY: all wasm-omp wasm-web run run-viewer run-wasm-omp run-wasm-web render extract typeset-expression verify clean
 
 all: $(TARGET)
 
@@ -68,14 +78,50 @@ $(WASM_NODE_TARGET): $(SRC) $(HDR) Makefile $(OPENMP_WASM_PREFIX)/lib/libomp.a
 
 wasm-omp: $(WASM_NODE_TARGET)
 
+$(WASM_WEB_TARGET): $(WEB_SRC) $(HDR) Makefile $(GLYPH_TABLE) $(OPENMP_WASM_PREFIX)/lib/libomp.a
+	mkdir -p $(WASM_WEB_DIR) && $(EMSDK_ENV) && emcc $(WASM_CFLAGS) -I$(OPENMP_WASM_PREFIX)/include $(WEB_SRC) $(OPENMP_WASM_PREFIX)/lib/libomp.a $(LDLIBS) \
+		-sPTHREAD_POOL_SIZE=8 \
+		-sINITIAL_MEMORY=268435456 \
+		-sSTACK_SIZE=$(WASM_STACK_SIZE) \
+		-sDEFAULT_PTHREAD_STACK_SIZE=$(WASM_STACK_SIZE) \
+		-sALLOW_BLOCKING_ON_MAIN_THREAD=1 \
+		-sFORCE_FILESYSTEM=1 \
+		-sMODULARIZE=1 \
+		-sEXPORT_NAME=createProsperoModule \
+		-sENVIRONMENT=web,worker \
+		-sEXPORTED_FUNCTIONS='$(WASM_WEB_EXPORTS)' \
+		-sEXPORTED_RUNTIME_METHODS='$(WASM_WEB_RUNTIME)' \
+		--preload-file $(GLYPH_TABLE)@glyph_table.txt \
+		--no-entry \
+		-o $@
+
+wasm-web: $(WASM_WEB_TARGET) $(WASM_WEB_FALLBACK_TARGET)
+
+$(WASM_WEB_FALLBACK_TARGET): $(WEB_SRC) $(HDR) Makefile $(GLYPH_TABLE)
+	mkdir -p $(WASM_WEB_DIR) && $(EMSDK_ENV) && emcc $(WASM_FALLBACK_CFLAGS) $(WEB_SRC) $(LDLIBS) \
+		-sINITIAL_MEMORY=268435456 \
+		-sSTACK_SIZE=$(WASM_STACK_SIZE) \
+		-sFORCE_FILESYSTEM=1 \
+		-sMODULARIZE=1 \
+		-sEXPORT_NAME=createProsperoFallbackModule \
+		-sENVIRONMENT=web,worker \
+		-sEXPORTED_FUNCTIONS='$(WASM_WEB_EXPORTS)' \
+		-sEXPORTED_RUNTIME_METHODS='$(WASM_WEB_RUNTIME)' \
+		--preload-file $(GLYPH_TABLE)@glyph_table.txt \
+		--no-entry \
+		-o $@
+
 run: $(TARGET)
 	env $(RUN_ENV) ./$(TARGET) $(VM)
 
 run-viewer: $(VIEWER)
-	env $(RUN_ENV) ./$(VIEWER) --source-vm $(VM) --glyphs $(GLYPH_TABLE)
+	env $(RUN_ENV) ./$(VIEWER) --glyphs $(GLYPH_TABLE)
 
 run-wasm-omp: $(WASM_NODE_TARGET)
 	env OMP_NUM_THREADS=8 node $(WASM_NODE_TARGET) $(VM)
+
+run-wasm-web: wasm-web
+	python3 $(WEB_DIR)/server.py --root . --port $(PORT)
 
 render: $(TARGET)
 	env $(RUN_ENV) ./$(TARGET) $(VM) $(PPM)
@@ -96,3 +142,4 @@ clean:
 	rm -f $(VIEWER)
 	rm -f $(EXTRACT_TARGET)
 	rm -rf $(WASM_NODE_DIR)
+	rm -rf $(WASM_WEB_DIR)

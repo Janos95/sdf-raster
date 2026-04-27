@@ -86,42 +86,37 @@ static void parse_source_arg(const SourceProgram *p, const char *s, int32_t *ref
   parse_arg(p->ids, p->nids, s, ref, value);
 }
 
-static int load_source_vm(const char *path, SourceProgram *p) {
-  memset(p, 0, sizeof(*p));
-  FILE *f = fopen(path, "r");
-  if (!f) {
-    perror(path);
+static void copy_token(char *dst, size_t dst_size, const char *src) {
+  strncpy(dst, src, dst_size - 1);
+  dst[dst_size - 1] = 0;
+}
+
+static int add_source_instr(SourceProgram *p, const char *path, char **parts, int n) {
+  if (n < 2 || n > 4) {
+    fprintf(stderr, "%s: malformed embedded instruction\n", path);
     return -1;
   }
-  char line[256], id[32], op[32], a[64], b[64];
-  while (fgets(line, sizeof(line), f)) {
-    a[0] = b[0] = 0;
-    int n = sscanf(line, "%31s %31s %63s %63s", id, op, a, b);
-    if (n < 2 || line[0] == '#') continue;
-    int opcode = parse_op(op);
-    if (opcode < 0) {
-      fprintf(stderr, "%s: unknown op %s\n", path, op);
-      fclose(f);
-      return -1;
-    }
-    if (p->nins >= MAX_INS || p->nids >= UTIL_MAX_SOURCE_IDS) {
-      fprintf(stderr, "%s: too many instructions\n", path);
-      fclose(f);
-      return -1;
-    }
-    int idx = p->nins++;
-    strcpy(p->ins[idx].id, id);
-    p->ins[idx].in = (Instr){opcode, -1, -1, 0, 0};
-    strcpy(p->ids[p->nids].key, id);
-    p->ids[p->nids++].idx = idx;
-    if (n >= 3) parse_source_arg(p, a, &p->ins[idx].in.a, &p->ins[idx].in.fa);
-    if (n >= 4) parse_source_arg(p, b, &p->ins[idx].in.b, &p->ins[idx].in.fb);
+  int opcode = parse_op(parts[1]);
+  if (opcode < 0) {
+    fprintf(stderr, "%s: unknown op %s\n", path, parts[1]);
+    return -1;
   }
-  fclose(f);
+  if (p->nins >= MAX_INS || p->nids >= UTIL_MAX_SOURCE_IDS) {
+    fprintf(stderr, "%s: too many embedded instructions\n", path);
+    return -1;
+  }
+  int idx = p->nins++;
+  copy_token(p->ins[idx].id, sizeof(p->ins[idx].id), parts[0]);
+  p->ins[idx].in = (Instr){opcode, -1, -1, 0, 0};
+  copy_token(p->ids[p->nids].key, sizeof(p->ids[p->nids].key), parts[0]);
+  p->ids[p->nids++].idx = idx;
+  if (n >= 3) parse_source_arg(p, parts[2], &p->ins[idx].in.a, &p->ins[idx].in.fa);
+  if (n >= 4) parse_source_arg(p, parts[3], &p->ins[idx].in.b, &p->ins[idx].in.fb);
   return 0;
 }
 
-static int load_glyph_table(const char *path, const SourceProgram *src, Glyph glyph[UTIL_MAX_GLYPHS]) {
+static int load_glyph_table(const char *path, SourceProgram *src, Glyph glyph[UTIL_MAX_GLYPHS]) {
+  memset(src, 0, sizeof(*src));
   memset(glyph, 0, sizeof(Glyph) * UTIL_MAX_GLYPHS);
   FILE *f = fopen(path, "r");
   if (!f) {
@@ -132,10 +127,23 @@ static int load_glyph_table(const char *path, const SourceProgram *src, Glyph gl
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == '#' || line[0] == '\n') continue;
     char *tok = strtok(line, " \t\r\n");
-    if (!tok || strcmp(tok, "glyph")) continue;
+    if (!tok || !strcmp(tok, "program") || !strcmp(tok, "count")) continue;
     char *parts[80];
     int n = 0;
     while (n < (int)(sizeof parts / sizeof parts[0]) && (parts[n] = strtok(NULL, " \t\r\n"))) n++;
+    if (!strcmp(tok, "instr")) {
+      if (add_source_instr(src, path, parts, n) != 0) {
+        fclose(f);
+        return -1;
+      }
+      continue;
+    }
+    if (strcmp(tok, "glyph")) continue;
+    if (src->nins == 0) {
+      fprintf(stderr, "%s: missing embedded source instructions before glyph rows\n", path);
+      fclose(f);
+      return -1;
+    }
     if (n < 12) {
       fprintf(stderr, "%s: malformed glyph row\n", path);
       fclose(f);
@@ -172,12 +180,15 @@ static int load_glyph_table(const char *path, const SourceProgram *src, Glyph gl
     }
   }
   fclose(f);
+  if (src->nins == 0) {
+    fprintf(stderr, "%s: missing embedded source instructions\n", path);
+    return -1;
+  }
   return 0;
 }
 
-int text_program_load(TextProgram *tp, const char *source_vm, const char *glyph_table) {
+int text_program_load(TextProgram *tp, const char *glyph_table) {
   memset(tp, 0, sizeof(*tp));
-  if (load_source_vm(source_vm, &tp->src) != 0) return -1;
   return load_glyph_table(glyph_table, &tp->src, tp->glyph);
 }
 
