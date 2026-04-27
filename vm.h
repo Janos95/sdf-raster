@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 enum {
-  MAX_INS = 10000,
+  MAX_INS = 50000,
   MAX_LOCAL = 128,
   IMAGE_W = 1024,
   IMAGE_H = 1024,
@@ -14,7 +14,7 @@ enum {
 typedef enum { OP_CONST, OP_VARX, OP_VARY, OP_ADD, OP_SUB, OP_MUL, OP_NEG, OP_SQUARE, OP_SQRT, OP_MIN, OP_MAX, OP_QSUBK, OP_KSUBQ, OP_COUNT } Op;
 typedef struct {
   Op op;
-  int16_t a, b;
+  int32_t a, b;
   float fa, fb;
 } Instr;
 typedef struct {
@@ -34,8 +34,10 @@ int vm_add_instr(Instr in);
 int vm_instruction_count(void);
 int vm_frontier_count(void);
 int vm_checksum(void);
+const uint8_t *vm_image_data(void);
 void vm_worker_init(Worker *w);
 /* Call once per worker inside a shared OpenMP parallel region. */
 void vm_render_frame(Worker *w);
+void vm_render_root_frame(Worker *w, int root);
 
 #endif

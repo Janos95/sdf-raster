@@ -31,7 +31,7 @@ static int idof(const char *s) {
     if (!strcmp(ids[i].key, s)) return ids[i].idx;
   return -1;
 }
-static inline void parse_arg(const char *s, int16_t *ref, float *value) {
+static inline void parse_arg(const char *s, int32_t *ref, float *value) {
   if (s[0] == '_') *ref = idof(s);
   else *value = strtof(s, NULL);
 }
@@ -62,6 +62,23 @@ static void load_vm(const char *path) {
   fclose(f);
 }
 
+static void write_ppm(const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    perror("fopen");
+    exit(1);
+  }
+  fprintf(f, "P6\n%d %d\n255\n", IMAGE_W, IMAGE_H);
+  const uint8_t *image = vm_image_data();
+  for (int i = 0; i < IMAGE_W * IMAGE_H; i++) {
+    uint8_t v = image[i];
+    fputc(v, f);
+    fputc(v, f);
+    fputc(v, f);
+  }
+  fclose(f);
+}
+
 int main(int argc, char **argv) {
   vm_init_coords();
   load_vm(argc > 1 ? argv[1] : "prospero.vm");
@@ -88,5 +105,6 @@ int main(int argc, char **argv) {
   mean /= BENCH_RUNS;
   printf("instructions=%d frontier_terms=%d image=%dx%d checksum=%d\n", vm_instruction_count(), vm_frontier_count(), IMAGE_W, IMAGE_H, vm_checksum());
   printf("mean_ms=%.3f std_ms=%.3f min_ms=%.3f max_ms=%.3f\n", mean, sqrt(fmax(0, ss / BENCH_RUNS - mean * mean)), mn, mx);
+  if (argc > 2) write_ppm(argv[2]);
   return 0;
 }

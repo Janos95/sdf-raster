@@ -97,6 +97,7 @@ int vm_add_instr(Instr in) {
 }
 int vm_instruction_count(void) { return nins; }
 int vm_frontier_count(void) { return nfrontier; }
+const uint8_t *vm_image_data(void) { return image; }
 int vm_checksum(void) {
   int sum = 0;
   for (int i = 0; i < IMAGE_W * IMAGE_H; i++) sum += image[i];
@@ -110,14 +111,15 @@ void vm_init_coords(void) {
   for (int i = 0; i < IMAGE_W; i++) gx[i] = -1 + 2 * (float)i / (IMAGE_W - 1);
   for (int i = 0; i < IMAGE_H; i++) gy[i] = -1 + 2 * (float)i / (IMAGE_H - 1);
 }
-static void extract_frontier(void) {
+static void extract_frontier(int root) {
   nfrontier = 0;
+  if (root < 0 || root >= nins) return;
   if (++frontier_gen == 0) {
     memset(frontier_mark, 0, sizeof(frontier_mark));
     frontier_gen = 1;
   }
   int st[MAX_INS], sp = 0;
-  st[sp++] = nins - 1;
+  st[sp++] = root;
   while (sp) {
     int v = st[--sp];
     if (frontier_mark[v] == frontier_gen) continue;
@@ -542,12 +544,13 @@ static void render_terms(Worker *w) {
     if (contract_once(w, &t, (Box){-1, 1, -1, 1}, &b) && area(b) > 0) eval_box(w, &t, b);
   }
 }
-void vm_render_frame(Worker *w) {
+void vm_render_root_frame(Worker *w, int root) {
 #pragma omp single nowait
-  extract_frontier();
+  extract_frontier(root);
 #pragma omp for schedule(static) nowait
   for (int y = 0; y < IMAGE_H; y++) memset(&image[y * IMAGE_W], 0, IMAGE_W);
 #pragma omp barrier
   render_terms(w);
 #pragma omp barrier
 }
+void vm_render_frame(Worker *w) { vm_render_root_frame(w, nins - 1); }
