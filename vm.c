@@ -2,6 +2,8 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -29,9 +31,15 @@ typedef struct {
   uint8_t fill, nx, ny, nf, mode[MAX_LOCAL], arg[MAX_LOCAL], xop[MAX_LOCAL], yop[MAX_LOCAL], fop[MAX_LOCAL];
   Instr ins[MAX_LOCAL];
 } Tape;
+typedef struct {
+  char key[32];
+  int idx;
+} IdMap;
 
 static Instr ins[MAX_INS];
 static int nins, xidx = -1, yidx = -1, frontier[MAX_INS], nfrontier;
+static IdMap ids[MAX_INS];
+static int nids;
 static uint16_t frontier_mark[MAX_INS], frontier_gen = 1;
 static uint8_t image[IMAGE_W * IMAGE_H];
 static float gx[IMAGE_W], gy[IMAGE_H];
@@ -68,6 +76,21 @@ static inline uint8_t mode2(uint8_t a, uint8_t b) {
   if (b == MODE_SCALAR) return a;
   return a == b ? a : MODE_FULL;
 }
+static int parse_op(const char *s) {
+  static const char *name[] = {"const", "var-x", "var-y", "add", "sub", "mul", "neg", "square", "sqrt", "min", "max"};
+  for (int i = 0; i < (int)(sizeof name / sizeof name[0]); i++)
+    if (!strcmp(s, name[i])) return i;
+  return -1;
+}
+static int idof(const char *s) {
+  for (int i = 0; i < nids; i++)
+    if (!strcmp(ids[i].key, s)) return ids[i].idx;
+  return -1;
+}
+static inline void parse_arg(const char *s, int16_t *ref, float *value) {
+  if (s[0] == '_') *ref = idof(s);
+  else *value = strtof(s, NULL);
+}
 static inline float eval_scalar(Op op, float a, float b) {
   switch (op) {
   case OP_ADD: return a + b;
@@ -97,6 +120,7 @@ int vm_add_instr(Instr in) {
 }
 int vm_instruction_count(void) { return nins; }
 int vm_frontier_count(void) { return nfrontier; }
+const uint8_t *vm_image_data(void) { return image; }
 int vm_checksum(void) {
   int sum = 0;
   for (int i = 0; i < IMAGE_W * IMAGE_H; i++) sum += image[i];
@@ -109,6 +133,45 @@ void vm_worker_init(Worker *w) {
 void vm_init_coords(void) {
   for (int i = 0; i < IMAGE_W; i++) gx[i] = -1 + 2 * (float)i / (IMAGE_W - 1);
   for (int i = 0; i < IMAGE_H; i++) gy[i] = -1 + 2 * (float)i / (IMAGE_H - 1);
+}
+int vm_load_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    perror("fopen");
+    return -1;
+  }
+  vm_reset_program();
+  nids = 0;
+  char line[256], id[32], op[32], a[64], b[64];
+  while (fgets(line, sizeof(line), f)) {
+    a[0] = b[0] = 0;
+    int n = sscanf(line, "%31s %31s %63s %63s", id, op, a, b);
+    if (n < 2 || line[0] == '#') continue;
+    if (nids >= MAX_INS) {
+      fprintf(stderr, "too many instruction ids\n");
+      fclose(f);
+      return -1;
+    }
+    int opcode = parse_op(op);
+    if (opcode < 0) {
+      fprintf(stderr, "unknown op %s\n", op);
+      fclose(f);
+      return -1;
+    }
+    int idx = vm_instruction_count();
+    strcpy(ids[nids].key, id);
+    ids[nids++].idx = idx;
+    Instr in = {opcode, -1, -1, 0, 0};
+    if (n >= 3) parse_arg(a, &in.a, &in.fa);
+    if (n >= 4) parse_arg(b, &in.b, &in.fb);
+    if (vm_add_instr(in) != idx) {
+      fprintf(stderr, "too many instructions\n");
+      fclose(f);
+      return -1;
+    }
+  }
+  fclose(f);
+  return 0;
 }
 static void extract_frontier(void) {
   nfrontier = 0;

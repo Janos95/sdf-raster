@@ -30,10 +30,12 @@ typedef struct Worker {
 
 void vm_reset_program(void);
 void vm_init_coords(void);
+int vm_load_file(const char *path);
 int vm_add_instr(Instr in);
 int vm_instruction_count(void);
 int vm_frontier_count(void);
 int vm_checksum(void);
+const uint8_t *vm_image_data(void);
 void vm_worker_init(Worker *w);
 /* Call once per worker inside a shared OpenMP parallel region. */
 void vm_render_frame(Worker *w);
