@@ -2,9 +2,7 @@
   const canvas = document.getElementById("viewport");
   const ctx = canvas.getContext("2d", { alpha: false });
   const textarea = document.getElementById("text-input");
-  const renderButton = document.getElementById("render-button");
   const resetButton = document.getElementById("reset-button");
-  const resetLayoutButton = document.getElementById("reset-layout-button");
   const paramsControls = document.getElementById("params-controls");
   const state = document.getElementById("state");
   const renderMs = document.getElementById("render-ms");
@@ -22,6 +20,8 @@
     { key: "lineGap", label: "Line Gap", min: -20, max: 80, step: 1, precision: 0 }
   ];
   const PARAM_BY_KEY = new Map(PARAM_SPECS.map(spec => [spec.key, spec]));
+  const TEXT_RENDER_DELAY = 70;
+  const PARAM_RENDER_DELAY = 16;
 
   let worker;
   let imageData;
@@ -31,6 +31,7 @@
   let latestSeq = 0;
   let ready = false;
   let rendering = false;
+  let renderPending = false;
   let paramsState = {};
   let defaultParams = {};
   const paramElements = new Map();
@@ -42,9 +43,7 @@
 
   function setControlsEnabled(enabled) {
     textarea.disabled = !enabled;
-    renderButton.disabled = !enabled || rendering;
     resetButton.disabled = !enabled;
-    resetLayoutButton.disabled = !enabled;
     for (const elements of paramElements.values()) {
       elements.range.disabled = !enabled;
       elements.number.disabled = !enabled;
@@ -90,7 +89,7 @@
     const fallback = paramsState[key] ?? defaultParams[key] ?? spec.min;
     paramsState[key] = clampParam(spec, value, fallback);
     syncParamControl(key);
-    requestRender(false);
+    requestRender(PARAM_RENDER_DELAY);
   }
 
   function setParams(params) {
@@ -166,38 +165,51 @@
     textLen.textContent = String(frame.textLen);
   }
 
-  function requestRender(immediate = false) {
+  function requestRender(delay = TEXT_RENDER_DELAY) {
     if (!ready) return;
+    renderPending = true;
     window.clearTimeout(renderTimer);
-    const delay = immediate ? 0 : 120;
-    renderTimer = window.setTimeout(() => {
-      rendering = true;
-      setControlsEnabled(true);
-      setState("Render", "busy");
-      latestSeq = nextSeq++;
-      worker.postMessage({
-        type: "render",
-        seq: latestSeq,
-        text: textarea.value,
-        params: currentParams()
-      });
-    }, delay);
+    renderTimer = window.setTimeout(sendRender, delay);
+  }
+
+  function sendRender() {
+    renderTimer = 0;
+    if (!ready || !renderPending) return;
+    if (rendering) return;
+    renderPending = false;
+    rendering = true;
+    setControlsEnabled(true);
+    setState("Render", "busy");
+    latestSeq = nextSeq++;
+    worker.postMessage({
+      type: "render",
+      seq: latestSeq,
+      text: textarea.value,
+      params: currentParams()
+    });
   }
 
   function handleFrame(frame) {
     if (frame.seq && frame.seq < latestSeq) return;
-    if (typeof frame.text === "string" && textarea.value !== frame.text) {
+    const hasNewerInput = renderPending;
+    if (!hasNewerInput && typeof frame.text === "string" && textarea.value !== frame.text) {
       const cursor = textarea.selectionStart;
       textarea.value = frame.text;
       const nextCursor = Math.min(cursor, frame.text.length);
       textarea.setSelectionRange(nextCursor, nextCursor);
     }
-    if (frame.params) setParams(frame.params);
+    if (!hasNewerInput && frame.params) setParams(frame.params);
     paintGray(frame.width, frame.height, frame.pixels);
     updateStats(frame);
     rendering = false;
     setControlsEnabled(true);
-    setState("Ready");
+    if (renderPending) {
+      setState("Render", "busy");
+      window.clearTimeout(renderTimer);
+      renderTimer = window.setTimeout(sendRender, 0);
+    } else {
+      setState("Ready");
+    }
   }
 
   function boot() {
@@ -241,16 +253,12 @@
     const queryParams = new URLSearchParams(window.location.search);
     const forceFallback = queryParams.has("fallback") || queryParams.get("threaded") === "0";
     worker.postMessage({ type: "init", threaded: window.crossOriginIsolated && !forceFallback });
-    textarea.addEventListener("input", () => requestRender(false));
-    renderButton.addEventListener("click", () => requestRender(true));
+    textarea.addEventListener("input", () => requestRender(TEXT_RENDER_DELAY));
     resetButton.addEventListener("click", () => {
       textarea.value = defaultText;
-      requestRender(true);
-      textarea.focus();
-    });
-    resetLayoutButton.addEventListener("click", () => {
       setParams(defaultParams);
-      requestRender(true);
+      requestRender(0);
+      textarea.focus();
     });
     canvas.addEventListener("click", () => textarea.focus());
   }
