@@ -156,7 +156,7 @@ button:disabled {
 
 .layout-controls {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   padding-top: 2px;
 }
 
@@ -177,22 +177,27 @@ h2 {
 }
 
 #reset-layout-button {
-  min-height: 32px;
-  padding: 0 10px;
+  min-height: 28px;
+  padding: 0 9px;
   font-size: 12px;
 }
 
 .params-controls {
   display: grid;
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
 }
 
 .param-row {
   display: grid;
-  grid-template-columns: 82px minmax(0, 1fr) 76px;
+  grid-template-columns: minmax(0, 1fr) 56px;
   align-items: center;
-  gap: 8px;
+  gap: 3px 7px;
   min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #171a1e;
 }
 
 .param-label {
@@ -205,21 +210,24 @@ h2 {
 }
 
 .param-row input[type="range"] {
+  grid-column: 1 / -1;
   min-width: 0;
   width: 100%;
+  height: 16px;
+  margin: 0;
   accent-color: var(--accent);
 }
 
 .param-row input[type="number"] {
-  width: 76px;
+  width: 56px;
   min-width: 0;
-  padding: 6px 7px;
+  padding: 3px 5px;
   border: 1px solid var(--line);
   border-radius: 6px;
   outline: none;
   background: #15181b;
   color: var(--text);
-  font-size: 12px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -284,11 +292,7 @@ h2 {
 }
 
 @media (max-width: 480px) {
-  .param-row {
-    grid-template-columns: minmax(0, 1fr) 76px;
-  }
-
-  .param-label {
-    grid-column: 1 / -1;
+  .params-controls {
+    grid-template-columns: 1fr;
   }
 }
