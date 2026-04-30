@@ -22,41 +22,54 @@
     <script defer src="viewer.js"></script>
   </head>
   <body>
-    <main class="app-shell">
-      <section class="viewer-pane" aria-label="Rendered output">
-        <canvas id="viewport" width="1024" height="1024"></canvas>
-      </section>
-      <aside class="control-pane">
-        <textarea id="text-input" spellcheck="false"></textarea>
-        <section class="layout-controls" aria-label="Layout">
-          <div class="layout-title-row">
-            <h2>Layout</h2>
-          </div>
-          <div id="params-controls" class="params-controls"></div>
-          <div class="layout-actions">
-            <button id="reset-button" type="button">Reset</button>
-            <span id="state" class="state">Loading</span>
-          </div>
+    <main class="page-shell">
+      <nav class="page-nav" aria-label="Primary">
+        <div class="nav-group">
+          <a class="nav-link" href="../../index.html">Home</a>
+          <a class="nav-link" href="../../blog/index.html">Blog</a>
+        </div>
+      </nav>
+
+      <header class="hero">
+        <h1>SDF Raster Viewer</h1>
+      </header>
+
+      <section class="viewer-app" aria-label="SDF raster viewer">
+        <section class="viewer-pane" aria-label="Rendered output">
+          <canvas id="viewport" width="1024" height="1024"></canvas>
         </section>
-        <dl class="stats">
-          <div>
-            <dt>Render</dt>
-            <dd id="render-ms">-</dd>
-          </div>
-          <div>
-            <dt>Threads</dt>
-            <dd id="threads">-</dd>
-          </div>
-          <div>
-            <dt>Bytecode</dt>
-            <dd id="instructions">-</dd>
-          </div>
-          <div>
-            <dt>Text Length</dt>
-            <dd id="text-len">-</dd>
-          </div>
-        </dl>
-      </aside>
+        <section class="control-pane" aria-label="Viewer controls">
+          <textarea id="text-input" spellcheck="false"></textarea>
+          <section class="layout-controls" aria-label="Layout">
+            <div class="layout-title-row">
+              <h2>Layout</h2>
+            </div>
+            <div id="params-controls" class="params-controls"></div>
+            <div class="layout-actions">
+              <button id="reset-button" type="button">Reset</button>
+              <span id="state" class="state">Loading</span>
+            </div>
+          </section>
+          <dl class="stats">
+            <div>
+              <dt>Render</dt>
+              <dd id="render-ms">-</dd>
+            </div>
+            <div>
+              <dt>Threads</dt>
+              <dd id="threads">-</dd>
+            </div>
+            <div>
+              <dt>Bytecode</dt>
+              <dd id="instructions">-</dd>
+            </div>
+            <div>
+              <dt>Text Length</dt>
+              <dd id="text-len">-</dd>
+            </div>
+          </dl>
+        </section>
+      </section>
     </main>
   </body>
 </html>
