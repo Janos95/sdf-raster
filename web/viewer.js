@@ -1,6 +1,6 @@
 (() => {
   const canvas = document.getElementById("viewport");
-  const ctx = canvas.getContext("2d", { alpha: false });
+  const ctx = canvas.getContext("2d");
   const textarea = document.getElementById("text-input");
   const resetButton = document.getElementById("reset-button");
   const paramsControls = document.getElementById("params-controls");
@@ -47,6 +47,11 @@
     for (const elements of paramElements.values()) {
       elements.range.disabled = !enabled;
     }
+  }
+
+  function fitTextarea() {
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight + 2}px`;
   }
 
   function clampParam(spec, value, fallback) {
@@ -128,7 +133,7 @@
     setControlsEnabled(ready);
   }
 
-  function paintGray(width, height, buffer) {
+  function paintTextMask(width, height, buffer) {
     if (!imageData || canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
@@ -138,10 +143,10 @@
     const dst = imageData.data;
     for (let i = 0, j = 0; i < src.length; i++, j += 4) {
       const v = src[i];
-      dst[j] = v;
-      dst[j + 1] = v;
-      dst[j + 2] = v;
-      dst[j + 3] = 255;
+      dst[j] = 0;
+      dst[j + 1] = 0;
+      dst[j + 2] = 0;
+      dst[j + 3] = v;
     }
     ctx.putImageData(imageData, 0, 0);
   }
@@ -185,9 +190,10 @@
       textarea.value = frame.text;
       const nextCursor = Math.min(cursor, frame.text.length);
       textarea.setSelectionRange(nextCursor, nextCursor);
+      fitTextarea();
     }
     if (!hasNewerInput && frame.params) setParams(frame.params);
-    paintGray(frame.width, frame.height, frame.pixels);
+    paintTextMask(frame.width, frame.height, frame.pixels);
     updateStats(frame);
     rendering = false;
     setControlsEnabled(true);
@@ -212,6 +218,7 @@
         setParams(message.params || defaultParams);
         buildParamControls();
         textarea.value = defaultText;
+        fitTextarea();
         handleFrame(message.frame);
         return;
       }
@@ -241,9 +248,13 @@
     const queryParams = new URLSearchParams(window.location.search);
     const forceFallback = queryParams.has("fallback") || queryParams.get("threaded") === "0";
     worker.postMessage({ type: "init", threaded: window.crossOriginIsolated && !forceFallback });
-    textarea.addEventListener("input", () => requestRender(TEXT_RENDER_DELAY));
+    textarea.addEventListener("input", () => {
+      fitTextarea();
+      requestRender(TEXT_RENDER_DELAY);
+    });
     resetButton.addEventListener("click", () => {
       textarea.value = defaultText;
+      fitTextarea();
       setParams(defaultParams);
       requestRender(0);
       textarea.focus();
